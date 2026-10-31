@@ -76,8 +76,23 @@ def h_create(fastzap.Request req) -> fastzap.Response:
         case validation.ValidationResult.Err(errs):
             return fastzap.validation_error(errs)
 
-def build_app() -> fastzap.App:
-    # The `@app.*` decorators splice `app.get/post(...)` in right here.
+# A docs-disabled app, built with a NON-`app` variable name so the module-level
+# `@app.*` decorators (which target a binding named `app`) do not splice their
+# registrations in here — this app deliberately has no routes; the disabled-docs
+# checks only need the endpoints to 404.
+def disabled_app() -> fastzap.App:
+    auto a = fastzap.app()
+    a.configure_docs(fastzap.docs_config(enabled=False))
+    return a
+
+def main():
+    # Build the app HERE, with a single binding named `app`, so the module-level
+    # `@app.get`/`@app.post` decorators splice their `app.get/post(...)`
+    # registrations in right after this line (exactly as params_test/
+    # decorator_test do). The `with_*` attachers then run against a populated
+    # route table. (A second `app`-named binding — e.g. building in a helper and
+    # doing `auto app = build_app()` here — would steal the decorator splice and
+    # leave the attachers running against an empty table.)
     auto app = fastzap.app()
     app.configure_docs(
         fastzap.docs_config(title="Items API", version="9.9", description="demo"),
@@ -98,10 +113,6 @@ def build_app() -> fastzap.App:
         "/items",
         fastzap.response_spec(201, item_schema(), "the created item"),
     )
-    return app
-
-def main():
-    auto app = build_app()
 
     # --- /openapi.json: a valid OpenAPI 3 document -------------------------
     auto spec = fastzap.dispatch(app, fastzap.request("GET", "/openapi.json", ""))
@@ -170,11 +181,10 @@ def main():
     check("docs loads swagger css", docs.body.contains("swagger-ui.css"))
 
     # --- disabling the docs ------------------------------------------------
-    auto app2 = build_app()
-    app2.configure_docs(fastzap.docs_config(enabled=False))
-    auto off1 = fastzap.dispatch(app2, fastzap.request("GET", "/openapi.json", ""))
+    auto off = disabled_app()
+    auto off1 = fastzap.dispatch(off, fastzap.request("GET", "/openapi.json", ""))
     check_status("disabled openapi is 404", off1, 404)
-    auto off2 = fastzap.dispatch(app2, fastzap.request("GET", "/docs", ""))
+    auto off2 = fastzap.dispatch(off, fastzap.request("GET", "/docs", ""))
     check_status("disabled docs is 404", off2, 404)
 
     # --- direct emitter unit checks ----------------------------------------
