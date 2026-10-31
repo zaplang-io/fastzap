@@ -191,9 +191,14 @@ def main():
     app.with_params("GET", "/items/{id}", [
         fastzap.path_param_spec("id", fastzap.ParamType.IntT),
     ])
-    # Request + response body schemas for the OpenAPI document.
-    app.with_body("POST", "/items", item_schema())
-    app.with_response("POST", "/items", 201, item_schema(), "the created item")
+    # Request + response body schemas for the OpenAPI document. The spec builders
+    # are free functions (defaults live there; a method takes positional-only
+    # args in Zap v1, so `with_body`/`with_response` take a pre-built spec).
+    app.with_body("POST", "/items", fastzap.request_body_spec(item_schema()))
+    app.with_response(
+        "POST", "/items",
+        fastzap.response_spec(201, item_schema(), "the created item"),
+    )
 
     # Customize the info block / paths, or turn the docs off entirely.
     app.configure_docs(fastzap.docs_config(title="Items API", version="1.0.0"))

@@ -92,8 +92,12 @@ def build_app() -> fastzap.App:
         ],
     )
     # Body/response schema associations (D-FZ-0012) — the `schemas` source.
-    app.with_body("POST", "/items", item_schema())
-    app.with_response("POST", "/items", 201, item_schema(), "the created item")
+    app.with_body("POST", "/items", fastzap.request_body_spec(item_schema()))
+    app.with_response(
+        "POST",
+        "/items",
+        fastzap.response_spec(201, item_schema(), "the created item"),
+    )
     return app
 
 def main():

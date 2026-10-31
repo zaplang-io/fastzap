@@ -112,8 +112,12 @@ def main():
     # the specs above; associate the POST body + response schemas explicitly so
     # they appear in the document (a handler validates its body internally, which
     # the framework cannot observe). `configure_docs` sets the info block.
-    app.with_body("POST", "/items", item_schema())
-    app.with_response("POST", "/items", 201, item_schema(), "the created item")
+    app.with_body("POST", "/items", fastzap.request_body_spec(item_schema()))
+    app.with_response(
+        "POST",
+        "/items",
+        fastzap.response_spec(201, item_schema(), "the created item"),
+    )
     app.configure_docs(fastzap.docs_config(title="items", version="0.1.0"))
 
     # Tune the staged drain for a fast-rolling deployment: keep serving 3s into

@@ -394,9 +394,15 @@ body↔route association is **declared explicitly**, keyed by method + path, the
 same shape as `with_params`:
 
 ```zap
-app.with_body("POST", "/items", item_schema())                 # requestBody
-app.with_response("POST", "/items", 201, item_schema(), "...")  # responses[201]
+app.with_body("POST", "/items", request_body_spec(item_schema()))      # requestBody
+app.with_response("POST", "/items", response_spec(201, item_schema()))  # responses[201]
 ```
+
+The spec builders `request_body_spec(schema, required=.., description=..)` and
+`response_spec(status, schema, description=..)` are **free functions** (where
+default/keyword args work — zaplang-io/zap#298); the `with_body`/`with_response`
+methods take a pre-built spec, because a method takes positional-only args in Zap
+v1, exactly as `with_params` takes pre-built `ParamSpec`s.
 
 This keeps the surface honest: it documents what the handler actually does and
 relies on **no** reflection capability that does not exist. The specs ride on the

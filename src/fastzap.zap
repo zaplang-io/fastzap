@@ -700,50 +700,39 @@ struct App:
     def configure_docs(self, DocsConfig cfg):
         self.docs = cfg
 
-    # Associate a request-body schema with an already-registered route (matched
-    # by method + path template). Declarative and decoupled from registration,
+    # Associate a request-body spec with an already-registered route (matched by
+    # method + path template). Declarative and decoupled from registration,
     # exactly like `with_params`, so it composes with BOTH the `@app.post`
     # decorator and programmatic `app.<verb>` calls. Read only by the OpenAPI
     # generator (fastzap#3); it does NOT change how `dispatch` runs the handler —
     # a handler still validates the body itself via `req.validate(schema)`. A
-    # method/path with no matching route is a no-op.
-    def with_body(
-        self,
-        str method,
-        str path,
-        validation.Schema schema,
-        bool required = True,
-        str description = "",
-    ):
+    # method/path with no matching route is a no-op. The spec is built with the
+    # free function `request_body_spec(schema, required=.., description=..)` —
+    # defaults live there, not here, because a method takes positional-only args
+    # in Zap v1 (zaplang-io/zap#298), exactly as `with_params` takes pre-built
+    # `ParamSpec`s.
+    def with_body(self, str method, str path, RequestBodySpec spec):
         auto i = 0
         while i < len(self.routes):
             auto r = self.routes[i]
             if r.method == method:
                 if r.path == path:
-                    list[RequestBodySpec] bs = [
-                        RequestBodySpec(schema, required, description),
-                    ]
+                    list[RequestBodySpec] bs = [spec]
                     r.request_bodies = bs
             i = i + 1
 
-    # Associate a response-body schema (at `status`) with an already-registered
-    # route. Appends, so several status codes can be declared for one route. Read
-    # only by the OpenAPI generator (fastzap#3). A method/path with no matching
-    # route is a no-op.
-    def with_response(
-        self,
-        str method,
-        str path,
-        int64 status,
-        validation.Schema schema,
-        str description = "",
-    ):
+    # Associate a response-body spec with an already-registered route. Appends,
+    # so several status codes can be declared for one route. Read only by the
+    # OpenAPI generator (fastzap#3). A method/path with no matching route is a
+    # no-op. Build the spec with the free function `response_spec(status, schema,
+    # description=..)` (see the note on `with_body` re: positional-only methods).
+    def with_response(self, str method, str path, ResponseSpec spec):
         auto i = 0
         while i < len(self.routes):
             auto r = self.routes[i]
             if r.method == method:
                 if r.path == path:
-                    r.responses.append(ResponseSpec(status, schema, description))
+                    r.responses.append(spec)
             i = i + 1
 
 # Construct a new application with default shutdown + docs settings.
