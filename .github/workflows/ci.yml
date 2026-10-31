@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Repo hygiene: layout + .zap source sanity. Does not compile Zap.
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell script syntax
+        run: |
+          for f in tools/*.sh; do echo "sh -n $f"; sh -n "$f"; done
+      - name: Layout sanity
+        run: |
+          test -f zap.toml
+          test -f src/fastzap.zap
+          test -f src/fastzap/wire.zap
+          test -f vendor/validation/src/validation.zap
+          test -f vendor/validation/src/validation/pattern.zap
+          test -f tests/fastzap_test.zap
+          test -s tests/fastzap_test.expected
+          test -f tests/shutdown_test.zap
+          test -s tests/shutdown_test.expected
+          test -f examples/quickstart.zap
+          test -f DESIGN.md
+          test -f DECISIONS.md
+          echo "layout OK"
+      - name: No CRLF / no tabs in .zap sources
+        run: |
+          ! grep -rlP '\r$' --include='*.zap' . || (echo "CRLF found" && exit 1)
+          ! grep -rlP '\t'  --include='*.zap' . || (echo "tab in .zap" && exit 1)
+
+  # Real compile + run of the offline test suite + example build through the
+  # prebuilt Zap toolchain image (zaplang-io/zap#277), published to GHCR and
+  # anonymously pullable. The image ships no git/node, so `container:` +
+  # actions/checkout is not usable; we check out on the host and run the
+  # toolchain via `docker run` over the mounted workspace. Fast and reproducible
+  # — no building the compiler from source. Not a required gate yet (the repo has
+  # no required checks). Local Docker/LLVM was unavailable while authoring, so
+  # this job (full codegen) is the gate for everything that actually runs the
+  # server + the staged-drain signal path; see DESIGN.md "Testing".
+  zap-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline suite + example build in the Zap toolchain image
+        run: |
+          docker run --rm -v "$PWD":/w -w /w ghcr.io/zaplang-io/zap:latest sh -c '
+            set -e
+            echo "zap: $(zap --version)"
+            # Canonical formatting gate (dogfoods `zap fmt`, D-0037). The vendored
+            # dependency under vendor/ is third-party and excluded.
+            zap fmt --check src tests examples
+            # Compile + run the native offline test suite (multi-module,
+            # multi-package: fastzap -> validation).
+            sh tools/run-tests.sh
+            # Compile-smoke the example server (it blocks on accept, so it is
+            # built, not run).
+            sh tools/build-examples.sh
+          '

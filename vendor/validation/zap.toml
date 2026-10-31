@@ -1,0 +1,13 @@
+# Vendored copy of the `validation` package (zaplang-io/validation), the
+# pydantic-style typed-model library fastzap builds its request/response models
+# on (zaplang-io/zap#311). It is vendored here, rather than pulled from a
+# registry, so the offline CI toolchain image (which has no registry or git
+# access) can resolve `import validation` as an ordinary path dependency. See
+# DECISIONS.md (D-FZ-0005) and vendor/README.md for the provenance + refresh
+# procedure. Keep this in sync with upstream `validation`.
+[package]
+name = "validation"
+version = "0.1.0"
+
+[dependencies]
+# None. validation uses only the stdlib `json` DOM (JsonValue).

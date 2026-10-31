@@ -1,0 +1,34 @@
+# Zap project manifest (zap.toml). TOML, Cargo-style (D-0052).
+#
+# `fastzap` is a non-core, official-tier package (D-0056): ONE coroutine-native
+# web framework for Zap that replaces flask + fastapi + starlette + uvicorn with
+# a single package (zaplang-io/zap#312). Because Zap coroutines are transparent
+# and cheap (no async/await, no function coloring), there is no sync/async split:
+# handlers are plain functions that do straight-line blocking I/O and return a
+# value, served concurrently by the framework's own built-in coroutine HTTP
+# server on the stdlib `http`/`net` stack (#104) over the netpoller (#80).
+#
+# Typed request/response models come from the `validation` package (#311) — Zap
+# structs validated by a schema, playing pydantic's role, with no separate schema
+# layer. Each request is handled inside its own structured-concurrency `scope:`
+# (#50), and SIGTERM triggers a staged, zero-dropped-request graceful drain (#77,
+# folded-in #107) suitable for Kubernetes.
+#
+# Layout (dogfoods Zap-to-Zap module imports, D-0081 / zaplang-io/zap#283):
+#   src/fastzap.zap        — the public API: App + decorator-style routing
+#                            registration, Request/Response, the coroutine server
+#                            and its run()/graceful-shutdown entry points, the
+#                            response builders, and the validation bridge.
+#   src/fastzap/wire.zap   — a self-contained HTTP/1.1 wire + URL helper (request
+#                            target / query parsing, response-byte serialization).
+#                            A leaf module (no import back into fastzap).
+# A consumer with `fastzap` as a dependency imports it as `import fastzap`.
+[package]
+name = "fastzap"
+version = "0.1.0"
+
+[dependencies]
+# The typed-model / validation layer. Vendored under vendor/validation so the
+# offline CI toolchain image resolves it without a registry (see DECISIONS.md
+# D-FZ-0005); swap for a registry/git source once the Zap registry is populated.
+validation = { path = "vendor/validation" }
