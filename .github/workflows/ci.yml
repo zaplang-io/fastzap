@@ -32,6 +32,8 @@ jobs:
           test -s tests/params_test.expected
           test -f tests/openapi_test.zap
           test -s tests/openapi_test.expected
+          test -f tests/middleware_test.zap
+          test -s tests/middleware_test.expected
           test -f tests/shutdown_test.zap
           test -s tests/shutdown_test.expected
           test -f examples/quickstart.zap

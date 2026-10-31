@@ -445,6 +445,94 @@ docs are served inline by `dispatch` today.
 UI (CSS + bundle) from jsDelivr at a pinned version; no bundle is vendored. Redoc
 would be a drop-in alternative; Swagger UI chosen for FastAPI familiarity.
 
+## D-FZ-0013 — Middleware / filter chain (the onion model)
+
+**Decision.** fastzap ships an ordered **middleware chain** wrapping `dispatch`.
+A middleware has the single **onion** shape
+
+```zap
+fn(Request, fn(Request) -> Response) -> Response      # fn(Request, next) -> Response
+```
+
+where `next` is the rest of the chain as a `fn(Request) -> Response`. It is
+registered with `app.use(mw)`, **outermost-first**. The uniform handler contract
+(`fn(Request) -> Response`, [D-FZ-0001](#d-fz-0001--method-call-routing-not-the-appget-decorator))
+is **unchanged** — middleware wraps `dispatch`, handlers are oblivious to it. Four
+built-ins ship: `error_mapper()`, `request_id()`, `access_log()`, `cors()`.
+
+**Why the onion (one `next`), not a before/after pair.** The single `next` seam
+expresses all three behaviours with no extra machinery:
+- **pass-through + after-handling** — call `next(req)`, inspect/rebuild its
+  Response, return it;
+- **short-circuit** — return a Response *without* calling `next` (auth 401, a
+  cache hit, a CORS preflight);
+- **before-handling** — run work before calling `next`.
+
+A before/after pair would need its own short-circuit signal and a way to thread
+mutated state between the two halves; the onion gets both for free, and composes
+by simple wrapping. It is also the shape FastAPI/Starlette and Express converge
+on. The cost — `next` is a first-class fn value — is exactly what the language now
+supports soundly: closures (zaplang-io/zap#163 / D-0067) and sound fn-value
+coercion (zaplang-io/zap#465 / D-0091).
+
+**How the chain is built.** `dispatch(app, req)` folds the registered middlewares
+around the terminal route dispatch (`_dispatch_core`, the former `dispatch` body):
+`_run_chain(app, i, req)` invokes middleware `i` with a `next` **closure** that
+runs the chain from `i + 1`, falling through to `_dispatch_core` when the chain is
+exhausted. Reading each middleware's handle out of the `list` element into a
+`fn(...)`-typed local re-attaches its signature before the call (a fn read from a
+list element otherwise loses its sig — the same idiom D-0067 fn-value code uses).
+An **empty chain makes `dispatch` identical to `_dispatch_core`**, so a
+middleware-free app is byte-for-byte unchanged and every pre-existing test stays
+green.
+
+**Order — outermost-first.** The first `app.use` is the outermost layer: it sees
+the Request first and the Response last. So register the error-mapper first (it
+must wrap everything to catch it), then request-id, then logging, then CORS
+closest to the handler. Rejected innermost-first (Rack/`wsgi`-style) because
+"the first thing you add runs first" reads more naturally and matches Express.
+
+**The error-mapper and the server backstop.** fastzap already produced a 500
+internally in the connection coroutine `_handle` (a `try/except` that must never
+let an exception escape — an escaped exception would cancel the request `scope:`
+and take down in-flight peers). That 500 is now **also** available as the
+outermost `error_mapper()` middleware: a handler/middleware exception unwinds
+through `next(req)` to its `try/except` and becomes the same JSON 500 envelope,
+but as a composable, after-handling-aware layer that other middleware's
+response-phase still runs around. The `_handle` backstop is **kept** — it is the
+coroutine safety boundary and also covers request *parse* failures (400) and the
+case where no error-mapper is registered. Defense in depth, not duplication: with
+`error_mapper()` registered, a handler error is mapped before it reaches the
+backstop; without it, the backstop still protects the coroutine.
+
+**Response headers — a new `Response.headers` field.** CORS and request-id must
+set response headers, but v1's `Response` was `(status, content_type, body)` only.
+`Response` gains a `dict[str, str] headers` (empty for every plain builder, so the
+wire output is unchanged unless a middleware adds one). `with_header(resp, name,
+value)` sets one **functionally** — it returns a *new* Response with a copied map
+(`dict.copy()`), because middleware treats the Response `next` produced as
+immutable. `wire.build_response_with(..., headers)` emits them after
+Content-Type/Content-Length and before `Connection: close`; `wire.build_response`
+is that with no extras, so its signature and the existing wire test are unchanged.
+
+**Configuration without method default args.** A configurable middleware
+(`request_id_header(name)`, `cors(origin)`) captures its configuration in the
+constructor via a `lambda` — a method cannot take a defaulted argument
+(zaplang-io/zap#481 miscompiles method default args), so config never rides on a
+method. Fixed middleware (`error_mapper`, `access_log`, `request_id`) use a
+top-level `def` as the handle. Both are plain `fn(...)` values stored in a
+`Middleware { name, handle }` record.
+
+**Scope (v1).** Middleware sees the whole `dispatch` (including the readiness and
+`/docs`/`/openapi.json` endpoints served inline by `_dispatch_core`). `access_log`
+logs `METHOD path -> status` (latency via `time.monotonic_ns()` around `next` is a
+noted extension, left out of the default so offline-test stdout stays stable);
+generated request-ids are `req-<nanos>` (a UUID/hex rendering is cosmetic). Auth,
+strict-param and the `/docs` serving can all later layer on this seam without
+touching handlers. `tests/middleware_test.zap` exercises ordering, short-circuit,
+request-id propagate+generate, CORS (+preflight), the error-mapper, and a combined
+stack, all through the real `dispatch` chain without a socket.
+
 ## Deferred to follow-up issues (against the #312 epic #432)
 
 Not blocking a coherent v1; noted so they are not forgotten:
@@ -458,7 +546,10 @@ Not blocking a coherent v1; noted so they are not forgotten:
   (D-FZ-0009). Only typed *path/query/body* per-parameter injection (a
   `@query`/`@path` source annotation) remains deferred — the still-open half of
   [D-FZ-0008](#d-fz-0008--dependency-injection-stays-deferred).
-- **Middleware / filters** — a before/after chain around `dispatch`.
+- **Middleware / filters** — **shipped**; an onion chain (`fn(Request, next) ->
+  Response`) wrapping `dispatch`, registered outermost-first with `app.use`, with
+  `error_mapper`/`request_id`/`access_log`/`cors` built-ins, see
+  [D-FZ-0013](#d-fz-0013--middleware--filter-chain-the-onion-model).
 - **`@app.get` decorator sugar** — **shipped**; see
   [D-FZ-0007](#d-fz-0007--app-get-decorator-routing-sugar).
 - **HTTPS/TLS termination** — the stdlib `http`/`net` is plaintext in v1; TLS

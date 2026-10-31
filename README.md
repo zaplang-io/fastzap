@@ -253,6 +253,53 @@ A provider parameter that is **not** itself `Depends(...)` is request-derived an
 rejected at compile time (`ZAP5048`). A future `@query`/`@path` source annotation
 is a separate capability. See [DECISIONS.md](DECISIONS.md) (D-FZ-0010).
 
+## Middleware
+
+Cross-cutting concerns — logging, request-id, CORS, auth, timing, error mapping —
+layer on with an **ordered middleware chain** wrapping `dispatch`, without
+touching handlers. A middleware has the **onion** shape `fn(Request, next) ->
+Response`, where `next` is the rest of the chain (`fn(Request) -> Response`): call
+`next(req)` to continue and inspect/modify its Response, or return a Response
+*without* calling `next` to short-circuit.
+
+```zap
+import fastzap
+
+def main():
+    auto app = fastzap.app()
+
+    # Registered OUTERMOST-FIRST: the error-mapper wraps everything; CORS sits
+    # closest to the handler. Handlers stay plain `fn(Request) -> Response`.
+    app.use(fastzap.error_mapper())   # any thrown error -> JSON 500
+    app.use(fastzap.request_id())     # reuse/generate X-Request-Id, echo it back
+    app.use(fastzap.access_log())     # one "METHOD path -> status" line per request
+    app.use(fastzap.cors_default())   # Access-Control-Allow-* (+ 204 preflight)
+
+    fastzap.run(app, "0.0.0.0", 8000)
+```
+
+Write your own with the same shape — this one adds an `X-App` header on the way
+out, or 401s a request with no credentials on the way in:
+
+```zap
+def require_auth(
+    fastzap.Request req,
+    fn(fastzap.Request) -> fastzap.Response nxt,
+) -> fastzap.Response:
+    if req.header("Authorization") == "":
+        return fastzap.json_error(401, "unauthorized")   # short-circuit
+    fn(fastzap.Request) -> fastzap.Response n = nxt
+    auto resp = n(req)                                    # pass through
+    return fastzap.with_header(resp, "X-App", "fastzap")  # after-handling
+
+# app.use(fastzap.middleware("auth", require_auth))
+```
+
+`app.use` registers outermost-first; an empty chain leaves `dispatch` unchanged.
+`next` is a first-class function value / closure (zaplang-io/zap#163, #465); a
+configurable built-in (`cors(origin)`, `request_id_header(name)`) captures its
+config in its constructor. See [DECISIONS.md](DECISIONS.md) (D-FZ-0013).
+
 ## Graceful shutdown (zero dropped requests)
 
 On **SIGTERM** (and SIGINT for local dev) fastzap runs a **staged drain**, not a
@@ -340,8 +387,9 @@ and strict typed-param coercion with a `422` via explicit param specs (D-FZ-0011
 generation (which will walk each route's param specs), typed per-parameter
 path/query/body *injection into the signature* (a `@query`/`@path` source
 annotation, distinct from `Depends` and from the framework-side spec surface that
-shipped), middleware/filters, HTTPS/TLS termination, and keep-alive / streaming
-bodies. See [DECISIONS.md](DECISIONS.md).
+shipped), HTTPS/TLS termination, and keep-alive / streaming bodies. OpenAPI/Swagger
+generation (D-FZ-0012) and the middleware/filter chain (D-FZ-0013) have since
+shipped. See [DECISIONS.md](DECISIONS.md).
 
 ## License
 
