@@ -96,19 +96,62 @@ values off the request:
 | `req.header("content-type")`     | request header, case-insensitive          |
 | `req.text()`                     | raw request body                          |
 | `req.validate(schema)`           | `validation.ValidationResult`             |
+| `req.param_int("id")`            | strictly-coerced declared param (int)     |
+| `req.param_str("q")`             | strictly-coerced declared param (str)     |
+| `req.param_bool("active")`       | strictly-coerced declared param (bool)    |
 
 Unknown paths return `404`; a known path reached with the wrong method returns
 `405`.
+
+## Strict typed params (422)
+
+The `query_int(name, fallback)` / `path_param_int(name, fallback)` accessors above
+are **lenient** — unparsable input returns the fallback, never an error. For
+FastAPI's strict behavior, **declare** a route's params and let fastzap validate
+and coerce them *before* the handler runs: a missing required param or an
+unparsable typed value is rejected with a `422` carrying field-located errors
+(the same `{"detail", "errors":[{loc, kind, msg}]}` envelope as body validation),
+and the handler reads the coerced value off `req.param_int/param_str/param_bool`.
+
+```zap
+@app.get("/items/{id}")
+def read_item(fastzap.Request req) -> fastzap.Response:
+    return fastzap.json_response(200, "{\"id\":" + str(req.param_int("id")) + "}")
+
+def main():
+    auto app = fastzap.app()           # @app.get splices app.get("/items/{id}", …) here
+    app.with_params("GET", "/items/{id}", [
+        fastzap.path_param_spec("id", fastzap.ParamType.IntT),
+        fastzap.query_param_default("limit", fastzap.ParamType.IntT, "10"),
+        fastzap.query_param_spec("q", fastzap.ParamType.StrT, required=False),
+    ])
+    fastzap.run(app, "0.0.0.0", 8000)
+```
+
+`GET /items/abc` now returns `422`
+(`{"loc":"path.id","kind":"int_parsing","msg":"value is not a valid integer"}`)
+instead of silently reading `0`. Build specs with `path_param_spec`,
+`query_param_spec` (required by default; pass `required=False` to allow absence),
+or `query_param_default` (optional with an applied default); the type is
+`fastzap.ParamType.IntT | StrT | BoolT`. `with_params` attaches them
+post-registration, so it composes with both the decorator and programmatic
+`app.<verb>(...)` routes. The lenient accessors are **unchanged** — strict is a
+per-route opt-in alongside them. Each `Route` carries its specs as structured
+data, which is also what OpenAPI parameter generation will walk (see DECISIONS.md
+D-FZ-0011).
 
 > **`Depends(...)` injection is supported; typed path/query/body injection is
 > not (yet).** A handler can declare dependencies as parameters with a
 > `Depends(provider)` default — the compiler injects them (see
 > [Dependency injection](#dependency-injection) below). What it does _not_ do is
 > read a handler's *scalar* parameter annotations to inject typed path/query/body
-> values (`id: int`, `q: str = ...`): those stay framework-side, pulled off the
-> `Request` itself (`path_param_int`, `query_int`, `validate`). A future
-> `@query`/`@path` source annotation is a separate capability. See
-> [DECISIONS.md](DECISIONS.md) (D-FZ-0007, D-FZ-0010).
+> values into the signature (`id: int`, `q: str = ...`): those stay
+> framework-side, pulled off the `Request` itself — leniently with
+> `path_param_int`/`query_int`, or strictly (with a `422`) via declared param
+> specs (see [Strict typed params](#strict-typed-params-422) above). A future
+> `@query`/`@path` source annotation that would inject coerced scalars into the
+> signature through the same adapter is a separate, still-unbuilt capability. See
+> [DECISIONS.md](DECISIONS.md) (D-FZ-0007, D-FZ-0010, D-FZ-0011).
 
 ## Typed models
 
@@ -247,12 +290,15 @@ tests and a runnable example.
 
 **Also in v1:** FastAPI-style `Depends(...)` dependency injection (D-FZ-0010) —
 handler parameters with a `Depends(provider)` default, resolved deps-first and
-once per request by a compiler-synthesized adapter (zaplang-io/zap#466, D-0092).
+once per request by a compiler-synthesized adapter (zaplang-io/zap#466, D-0092) —
+and strict typed-param coercion with a `422` via explicit param specs (D-FZ-0011).
 
 **Deferred follow-ups** (tracked against the #312 epic #432): OpenAPI/Swagger
-generation, typed per-parameter path/query/body injection (a `@query`/`@path`
-source annotation, distinct from `Depends`), middleware/filters, HTTPS/TLS
-termination, and keep-alive / streaming bodies. See [DECISIONS.md](DECISIONS.md).
+generation (which will walk each route's param specs), typed per-parameter
+path/query/body *injection into the signature* (a `@query`/`@path` source
+annotation, distinct from `Depends` and from the framework-side spec surface that
+shipped), middleware/filters, HTTPS/TLS termination, and keep-alive / streaming
+bodies. See [DECISIONS.md](DECISIONS.md).
 
 ## License
 

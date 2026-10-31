@@ -68,6 +68,18 @@
 # request-derived and rejected (ZAP5048). A future `@query`/`@path` source
 # annotation is a separate capability. See DECISIONS.md (D-FZ-0007, D-FZ-0010).
 #
+# STRICT TYPED PARAMS — explicit param specs + 422 (fastzap#4, D-FZ-0011):
+# The lenient accessors (`query_int(name, fallback)`, `path_param_int`) return the
+# caller's default on unparsable input. A route can instead DECLARE its params —
+# `app.with_params("GET", "/items/{id}", [path_param_spec("id", ParamType.IntT),
+# ...])` — and `dispatch` validates + coerces them off the Request BEFORE the
+# handler runs: a missing-required or unparsable value becomes a 422 with
+# field-located `validation.ValErr`s (FastAPI semantics), and on success the
+# handler reads coerced values off `req.param_int/param_str/param_bool`. The spec
+# list is the structured source for OpenAPI parameter docs (fastzap#3). This stays
+# framework-side (it does NOT go through the #466 injection adapter). The lenient
+# accessors are unchanged — strict is a variant alongside them.
+#
 # NOTE: Zap's `and`/`or` do not short-circuit today (both operands are always
 # evaluated, zaplang-io/zap), so this module never guards an index/lookup with a
 # boolean operator; such checks are written as nested `if`s.
@@ -91,6 +103,10 @@ struct Request:
     dict[str, str] query
     dict[str, str] path_params
     dict[str, str] headers
+    # Strictly-coerced declared params (see ParamSpec): populated by `dispatch`
+    # from the matched route's param specs BEFORE the handler runs, so a handler
+    # reads a typed value it can trust. Empty when the route declares no specs.
+    dict[str, JsonValue] params
 
     # The raw request body as a string (e.g. a JSON document).
     def text(self) -> str:
@@ -138,6 +154,46 @@ struct Request:
             return self.headers[key]
         return ""
 
+    # --- strict coerced-param accessors (the ParamSpec surface, fastzap#4) ------
+    # These read a value already validated + coerced by `dispatch` from the
+    # route's declared specs. Like `validation.Model`'s getters they assume the
+    # value is present and of the declared type; a name with no matching spec (or
+    # an absent optional with no default) reads back the type zero.
+
+    # A declared int param, coerced (0 when unspecified/absent-optional).
+    def param_int(self, str name) -> int64:
+        if name in self.params:
+            match self.params[name]:
+                case JsonValue.Int(i):
+                    return i
+                case _:
+                    return 0
+        return 0
+
+    # A declared str param, coerced ("" when unspecified/absent-optional).
+    def param_str(self, str name) -> str:
+        if name in self.params:
+            match self.params[name]:
+                case JsonValue.Str(s):
+                    return s
+                case _:
+                    return ""
+        return ""
+
+    # A declared bool param, coerced (False when unspecified/absent-optional).
+    def param_bool(self, str name) -> bool:
+        if name in self.params:
+            match self.params[name]:
+                case JsonValue.Bool(b):
+                    return b
+                case _:
+                    return False
+        return False
+
+    # True when a declared param produced a coerced value this request.
+    def has_param(self, str name) -> bool:
+        return name in self.params
+
 # A response: an HTTP status, a content type, and a body. Build one with the
 # helpers below (`json_response`, `ok_model`, ...) rather than by hand.
 struct Response:
@@ -150,9 +206,10 @@ struct Response:
 def request(str method, str target, str body) -> Request:
     dict[str, str] pp = {}
     dict[str, str] hdrs = {}
+    dict[str, JsonValue] prm = {}
     auto path = wire.target_path(target)
     auto query = wire.parse_query(wire.target_query(target))
-    return Request(method, path, target, body, query, pp, hdrs)
+    return Request(method, path, target, body, query, pp, hdrs, prm)
 
 # Parse an int, or return `fallback` when `s` is not a well-formed integer.
 # `int()` aborts (an uncatchable fault, not a catchable exception) on bad input,
@@ -226,16 +283,183 @@ def validation_error(list[validation.ValErr] errs) -> Response:
     return json_response(422, json.dumps(JsonValue.Object(top)))
 
 # ---------------------------------------------------------------------------
+# Strict typed-param specs (fastzap#4, D-FZ-0011)
+# ---------------------------------------------------------------------------
+#
+# The fallback accessors above (`query_int(name, fallback)`, `path_param_int`)
+# return the caller's default on unparsable input — FastAPI's strict-by-default
+# shape is deliberately NOT theirs. A route can instead DECLARE its params with an
+# explicit spec surface, validated and coerced BEFORE the handler runs: a missing
+# required param or an unparsable typed value collects a field-located
+# `validation.ValErr` and short-circuits to a 422 (FastAPI's semantics), through
+# the same `validation_error` envelope as request-body validation. On success the
+# handler reads coerced values off `req.param_int/param_str/param_bool`.
+#
+# The specs are structured data carried on each `Route` (name, location, type,
+# required, default, description) — exactly the OpenAPI Parameter Object shape, so
+# fastzap#3 generates `parameters:` by walking `route.params`, no second surface.
+#
+# SCOPE (D-0092 boundary, see D-FZ-0010): this is FRAMEWORK-SIDE coercion off the
+# Request. It does NOT go through the compiler's `Depends(...)` injection adapter
+# (zaplang-io/zap#466); a per-parameter `@query`/`@path` source annotation that
+# WOULD is a separate, still-unbuilt capability (the open half of D-FZ-0008).
+
+# Where a declared parameter is read from.
+enum ParamLoc:
+    Path
+    Query
+
+# The scalar type a declared parameter is coerced to. Mirrors the subset of
+# `validation.FieldType` a URL-string param can carry (int / str / bool).
+enum ParamType:
+    IntT
+    StrT
+    BoolT
+
+# A declared parameter: its name, where it is read from, the type it coerces to,
+# whether it must be present, an optional default (applied when an optional param
+# is absent), and a description slot for OpenAPI. Build one with the constructors
+# below rather than by hand.
+struct ParamSpec:
+    str name
+    ParamLoc loc
+    ParamType ptype
+    bool required
+    bool has_default
+    str default
+    str description
+
+# A required path parameter (a captured `{name}` segment is always present once
+# the route matches, so a path param is required by construction).
+def path_param_spec(str name, ParamType ptype, str description = "") -> ParamSpec:
+    return ParamSpec(name, ParamLoc.Path, ptype, True, False, "", description)
+
+# A query parameter, required by default. Pass `required=False` for one that may
+# be absent (absent → omitted from the coerced bag; the handler falls back).
+def query_param_spec(
+    str name,
+    ParamType ptype,
+    bool required = True,
+    str description = "",
+) -> ParamSpec:
+    return ParamSpec(name, ParamLoc.Query, ptype, required, False, "", description)
+
+# An optional query parameter with a default that is applied (and coerced) when
+# the parameter is absent.
+def query_param_default(
+    str name,
+    ParamType ptype,
+    str default,
+    str description = "",
+) -> ParamSpec:
+    return ParamSpec(name, ParamLoc.Query, ptype, False, True, default, description)
+
+# Validate + coerce every declared spec against the request, collecting a
+# field-located `ValErr` per failure into `errs` and each coerced value into
+# `out`. Never raises — numeric coercion pre-validates the string (`_is_int_str`)
+# before `int()`, which aborts uncatchably on bad input.
+def _validate_params(
+    list[ParamSpec] specs,
+    Request req,
+    dict[str, JsonValue] out,
+    list[validation.ValErr] errs,
+):
+    auto i = 0
+    while i < len(specs):
+        _validate_one_param(specs[i], req, out, errs)
+        i = i + 1
+
+def _validate_one_param(
+    ParamSpec sp,
+    Request req,
+    dict[str, JsonValue] out,
+    list[validation.ValErr] errs,
+):
+    auto loc = _param_loc(sp)
+    if _param_present(sp, req):
+        _coerce_param(sp, _param_raw(sp, req), loc, out, errs)
+    else:
+        if sp.required:
+            _perr(errs, loc, "missing", "field required")
+        else:
+            if sp.has_default:
+                _coerce_param(sp, sp.default, loc, out, errs)
+
+def _coerce_param(
+    ParamSpec sp,
+    str raw,
+    str loc,
+    dict[str, JsonValue] out,
+    list[validation.ValErr] errs,
+):
+    match sp.ptype:
+        case ParamType.IntT:
+            if _is_int_str(raw):
+                out[sp.name] = JsonValue.Int(int(raw))
+            else:
+                _perr(errs, loc, "int_parsing", "value is not a valid integer")
+        case ParamType.BoolT:
+            auto code = _bool_code(raw)
+            if code < 0:
+                _perr(errs, loc, "bool_parsing", "value is not a valid boolean")
+            else:
+                out[sp.name] = JsonValue.Bool(code == 1)
+        case ParamType.StrT:
+            out[sp.name] = JsonValue.Str(raw)
+
+# "path.<name>" / "query.<name>" — a dotted field-location path, matching the
+# `validation` package's dotted `ValErr.loc` convention ("address.zip").
+def _param_loc(ParamSpec sp) -> str:
+    match sp.loc:
+        case ParamLoc.Path:
+            return "path." + sp.name
+        case ParamLoc.Query:
+            return "query." + sp.name
+
+def _param_present(ParamSpec sp, Request req) -> bool:
+    match sp.loc:
+        case ParamLoc.Path:
+            return sp.name in req.path_params
+        case ParamLoc.Query:
+            return sp.name in req.query
+
+def _param_raw(ParamSpec sp, Request req) -> str:
+    match sp.loc:
+        case ParamLoc.Path:
+            return req.path_params[sp.name]
+        case ParamLoc.Query:
+            return req.query[sp.name]
+
+# Boolean coercion code: 1 = true, 0 = false, -1 = not a boolean. Accepts the
+# spellings true/false and 1/0, case-insensitively.
+def _bool_code(str s) -> int64:
+    auto low = s.lower()
+    if low == "true":
+        return 1
+    if low == "1":
+        return 1
+    if low == "false":
+        return 0
+    if low == "0":
+        return 0
+    return -1
+
+def _perr(list[validation.ValErr] errs, str loc, str kind, str msg):
+    errs.append(validation.ValErr(loc=loc, kind=kind, msg=msg))
+
+# ---------------------------------------------------------------------------
 # Routing
 # ---------------------------------------------------------------------------
 
 # A registered route: HTTP method, the path template, its precomputed segments
-# (a param segment keeps its `{name}` form), and the handler.
+# (a param segment keeps its `{name}` form), the handler, and any declared param
+# specs (empty unless attached via `App.with_params`; see fastzap#4).
 struct Route:
     str method
     str path
     list[str] segs
     fn(Request) -> Response handler
+    list[ParamSpec] params
 
 # The result of resolving a request against the route table. `idx` is the
 # matching route or -1; `path_exists` distinguishes 404 (no path match) from 405
@@ -332,7 +556,25 @@ struct App:
 
     # Register a handler for an arbitrary method + path template.
     def route(self, str method, str path, fn(Request) -> Response h):
-        self.routes.append(Route(method, path, wire.path_segments(path), h))
+        list[ParamSpec] no_specs = []
+        self.routes.append(Route(method, path, wire.path_segments(path), h, no_specs))
+
+    # Attach a strict param-spec surface to an already-registered route (matched
+    # by method + path template). Declarative and decoupled from registration, so
+    # it composes with BOTH the `@app.get` decorator (D-FZ-0007) — whose desugar
+    # splices the `app.get(...)` calls in right after `auto app = fastzap.app()`,
+    # so the routes already exist when this runs — and programmatic `app.<verb>`
+    # calls. The specs are validated + coerced before the handler runs (see
+    # `dispatch`) and are the structured source OpenAPI parameter docs read from
+    # (fastzap#3). A spec set for a method/path with no matching route is a no-op.
+    def with_params(self, str method, str path, list[ParamSpec] specs):
+        auto i = 0
+        while i < len(self.routes):
+            auto r = self.routes[i]
+            if r.method == method:
+                if r.path == path:
+                    r.params = specs
+            i = i + 1
 
     def get(self, str path, fn(Request) -> Response h):
         self.route("GET", path, h)
@@ -373,7 +615,19 @@ def dispatch(App app, Request req) -> Response:
             return json_error(405, "method not allowed")
         return json_error(404, "not found")
     req.path_params = m.params
-    fn(Request) -> Response h = app.routes[m.idx].handler
+    auto route = app.routes[m.idx]
+    # Strict param coercion (fastzap#4): validate the route's declared specs
+    # BEFORE the handler runs. A missing-required or unparsable value yields a
+    # 422 with field-located errors; on success the handler reads the coerced
+    # values off `req.param_*`. Routes with no specs skip this entirely.
+    if len(route.params) > 0:
+        dict[str, JsonValue] coerced = {}
+        list[validation.ValErr] errs = []
+        _validate_params(route.params, req, coerced, errs)
+        if len(errs) > 0:
+            return validation_error(errs)
+        req.params = coerced
+    fn(Request) -> Response h = route.handler
     return h(req)
 
 # ---------------------------------------------------------------------------
@@ -489,8 +743,9 @@ def _build_request(bytes reqh) -> Request:
     auto query = wire.parse_query(wire.target_query(target))
     dict[str, str] pp = {}
     dict[str, str] hdrs = {}
+    dict[str, JsonValue] prm = {}
     _collect_headers(hdrs, reqh)
-    return Request(method, path, target, body, query, pp, hdrs)
+    return Request(method, path, target, body, query, pp, hdrs, prm)
 
 # Snapshot a standard subset of request headers (lowercase keys). Full header
 # enumeration needs the `http` stdlib to expose the raw header block; until then

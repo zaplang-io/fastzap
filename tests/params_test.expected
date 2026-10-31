@@ -1,0 +1,24 @@
+ok valid coerces status
+ok valid coerces int+str+bool
+ok optional default applied
+ok bool false spelling
+ok bool case-insensitive true
+ok valid path int status
+ok valid path int coerced
+ok missing required is 422
+ok missing names the field
+ok missing kind is 'missing'
+ok unparsable query int is 422
+ok query int error located
+ok query int error kind
+ok unparsable path int is 422
+ok path int error located
+ok unparsable bool is 422
+ok bool error kind
+ok multi-error is 422
+ok multi reports missing q
+ok multi reports bad n
+ok no-spec route still 200
+ok query_int fallback unchanged on garbage
+ok query_int parses when valid
+all tests passed
