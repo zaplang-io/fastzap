@@ -168,15 +168,55 @@ an incompatible function value is accepted as a `fn(...)` with no diagnostic —
 **zaplang-io/zap#465**. fastzap#7 is blocked on #466 (not #16); it lands when the
 adapter capability exists.
 
+## D-FZ-0009 — Dependency injection: an explicit, type-safe prototype
+
+**Decision.** Ship a dependency-injection toolkit (`src/fastzap/di.zap`) that
+delivers the *semantics* of FastAPI `Depends` — **composable**, **per-request**,
+**shared (resolved once)** dependencies — as an explicit, opt-in, fully type-safe
+API the handler drives itself. This is a **prototype**, deliberately **not** the
+FastAPI signature; it coexists with D-FZ-0008 (which records why the real
+param-injection form is blocked on zaplang-io/zap#466) rather than superseding it.
+
+**Why not the FastAPI form.** FastAPI *injects* resolved values into a handler's
+declared parameters (`def h(db: DB = Depends(get_db))`). That needs a
+reflection-driven adapter binding params per request, which the language cannot
+express (D-FZ-0008 / zap#466). Rather than fake it — the defaulted-param form
+compiles but silently drops the default and mismatches arity (zap#465) — the
+prototype keeps injection **explicit and visible** in the handler body.
+
+**The model.**
+- `Cell[T]` — a per-request memo slot (a reference `struct` wrapping
+  `Optional[T]`); `new_cell`, `cell_has`, `cell_put`, `cell_value`, `cell_or`, and
+  the headline `resolve(cell, provider)` ("resolve once"). Built on generics
+  (zap#154) + `Optional`; a LEAF module (imports no fastzap type).
+- A dependency is a plain **provider function**. The app bundles one `Cell` per
+  shared dependency into a concrete per-request context `struct` and builds a
+  fresh one at the top of each handler. **Per-request** = per-handler, because
+  exactly one handler runs per request. **Composition** = a provider calls
+  another provider on the same context (inside the `resolve` thunk, so each still
+  resolves once). **Shared** = the `Cell` memoizes, so a dependency needed by
+  several providers runs once per request.
+- **Engine unchanged.** Handlers stay `fn(Request) -> Response` and opt in inside
+  the body, so DI composes with the `@app.get` sugar (D-FZ-0007) untouched.
+
+**Boundary / forward path.** This is not auto-wiring: the handler explicitly
+constructs its context and calls providers; there is no reflection and no
+per-parameter binding. When zap#466 lands, the `Depends`-in-the-signature form can
+be layered **over these same providers** — the provider functions and `Cell` memo
+are exactly the resolution substrate an adapter would call. `tests/di_test.zap`
+exercises composition (settings ← db ← principal), per-request freshness, and
+single-resolution over the real `@app.get` dispatch path.
+
 ## Deferred to follow-up issues (against the #312 epic #432)
 
 Not blocking a coherent v1; noted so they are not forgotten:
 
 - **OpenAPI/Swagger generation** — needs schema introspection over the
   `validation` schemas + a route-table walk.
-- **Dependency injection** — now precisely blocked; see
-  [D-FZ-0008](#d-fz-0008--dependency-injection-stays-deferred) and
-  zaplang-io/zap#466.
+- **Dependency injection** — an explicit, type-safe **prototype** ships
+  ([D-FZ-0009](#d-fz-0009--dependency-injection-an-explicit-type-safe-prototype));
+  the FastAPI param-injection *signature* stays blocked on zaplang-io/zap#466
+  ([D-FZ-0008](#d-fz-0008--dependency-injection-stays-deferred)).
 - **Middleware / filters** — a before/after chain around `dispatch`.
 - **`@app.get` decorator sugar** — **shipped**; see
   [D-FZ-0007](#d-fz-0007--app-get-decorator-routing-sugar).
