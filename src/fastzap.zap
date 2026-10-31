@@ -195,12 +195,18 @@ struct Request:
     def has_param(self, str name) -> bool:
         return name in self.params
 
-# A response: an HTTP status, a content type, and a body. Build one with the
-# helpers below (`json_response`, `ok_model`, ...) rather than by hand.
+# A response: an HTTP status, a content type, a body, and any extra headers. Build
+# one with the helpers below (`json_response`, `ok_model`, ...) rather than by
+# hand. `headers` is empty for a plain builder — the wire layer always emits
+# Content-Type/Content-Length/Connection; this map carries ADDITIONS a middleware
+# layers on (e.g. `X-Request-Id`, `Access-Control-Allow-Origin`). Set them
+# functionally with `with_header` (a middleware treats a Response as immutable and
+# returns a new value). See D-FZ-0013.
 struct Response:
     int64 status
     str content_type
     str body
+    dict[str, str] headers
 
 # Build a hand-rolled request (useful for tests and manual dispatch): parses the
 # target into its path + query. Headers are empty.
@@ -242,19 +248,38 @@ def _is_int_str(str s) -> bool:
 # --- response builders -----------------------------------------------------
 
 def response(int64 status, str content_type, str body) -> Response:
-    return Response(status, content_type, body)
+    dict[str, str] h = {}
+    return Response(status, content_type, body, h)
 
 # A JSON response from an already-serialized body string.
 def json_response(int64 status, str body) -> Response:
-    return Response(status, "application/json", body)
+    dict[str, str] h = {}
+    return Response(status, "application/json", body, h)
 
 # A plain-text response.
 def text_response(int64 status, str body) -> Response:
-    return Response(status, "text/plain; charset=utf-8", body)
+    dict[str, str] h = {}
+    return Response(status, "text/plain; charset=utf-8", body, h)
 
 # An HTML response (used to serve the interactive `/docs` page, fastzap#3).
 def html_response(int64 status, str body) -> Response:
-    return Response(status, "text/html; charset=utf-8", body)
+    dict[str, str] h = {}
+    return Response(status, "text/html; charset=utf-8", body, h)
+
+# Return a copy of `r` with the header `name: value` set. Functional: a middleware
+# treats the Response `next` produced as immutable and returns a NEW value, so
+# `dict.copy()` gives each returned Response its own header map rather than
+# aliasing and mutating a shared one.
+def with_header(Response r, str name, str value) -> Response:
+    auto h = r.headers.copy()
+    h[name] = value
+    return Response(r.status, r.content_type, r.body, h)
+
+# A response header previously set via `with_header` ("" when absent).
+def response_header(Response r, str name) -> str:
+    if name in r.headers:
+        return r.headers[name]
+    return ""
 
 # 200 with a validated model serialized back to JSON.
 def ok_model(validation.Model m) -> Response:
@@ -634,6 +659,58 @@ def docs_config(
     return DocsConfig(enabled, openapi_path, docs_path, title, version, description)
 
 # ---------------------------------------------------------------------------
+# Middleware / filter chain (fastzap#2, D-FZ-0013)
+# ---------------------------------------------------------------------------
+#
+# A middleware wraps `dispatch`: it sees every `Request` on the way in and every
+# `Response` on the way out, and can either pass through to the rest of the chain
+# or short-circuit with its own `Response`. Logging, request-id, CORS, auth and
+# error-mapping all layer on this way WITHOUT touching the uniform handler
+# contract (`fn(Request) -> Response`, D-FZ-0001) — handlers are oblivious to it.
+#
+# THE SHAPE — the onion model. A middleware is
+#
+#   fn(Request, fn(Request) -> Response) -> Response
+#
+# i.e. `fn(Request, next) -> Response` where `next` is the REST of the chain,
+# itself a `fn(Request) -> Response`. One shape gives all three behaviours:
+#   * pass through + observe/modify — call `next(req)`, inspect/rebuild its
+#     Response, return it (the "after handler" half);
+#   * short-circuit — return a Response WITHOUT calling `next` (auth 401, a cache
+#     hit, a CORS preflight);
+#   * before-handler work — do it before calling `next`.
+# It composes by wrapping: the chain is built by folding each middleware around
+# the terminal `dispatch` fn, innermost-out. Chosen over a separate before/after
+# pair because short-circuit and after-handling fall out of the single `next`
+# seam with no extra machinery, and because `next` as a first-class fn value is
+# exactly what the language now supports soundly (zaplang-io/zap#163 closures /
+# #465 fn-value coercion). See DECISIONS.md D-FZ-0013.
+#
+# ORDER — `app.use(mw)` registers OUTERMOST-FIRST. The first middleware registered
+# is the outermost layer: it sees the Request first and the Response last. So the
+# error-mapper is registered first (it must wrap everything to catch it), then
+# request-id, then logging, then CORS, closest to the handler. An empty chain
+# makes `dispatch` byte-identical to the bare route dispatch (`_dispatch_core`),
+# so a middleware-free app is unchanged.
+
+# A registered middleware: a `name` (for logs / introspection) and the onion
+# `handle` hook. Build one with `middleware(name, handle)` or a built-in
+# constructor (`error_mapper`, `request_id`, `access_log`, `cors`). The handle is
+# a first-class fn value (a top-level `def` for a fixed middleware, or a capturing
+# `lambda` for a configurable one — a method cannot carry config as a default
+# argument, zaplang-io/zap#481, so configuration is captured in the constructor).
+struct Middleware:
+    str name
+    fn(Request, fn(Request) -> Response) -> Response handle
+
+# Wrap a handle fn as a named `Middleware`.
+def middleware(
+    str name,
+    fn(Request, fn(Request) -> Response) -> Response handle,
+) -> Middleware:
+    return Middleware(name, handle)
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
@@ -642,6 +719,7 @@ struct App:
     ServerState state
     ShutdownConfig shutdown
     DocsConfig docs
+    list[Middleware] middlewares
 
     # Register a handler for an arbitrary method + path template.
     def route(self, str method, str path, fn(Request) -> Response h):
@@ -692,6 +770,13 @@ struct App:
     def patch(self, str path, fn(Request) -> Response h):
         self.route("PATCH", path, h)
 
+    # Register a middleware (fastzap#2). Appends in OUTERMOST-FIRST order: the
+    # first `use` is the outermost layer, so register the error-mapper first (it
+    # wraps everything) and CORS/logging last (closest to the handler). The chain
+    # wraps `dispatch`; the handler contract is untouched. See D-FZ-0013.
+    def use(self, Middleware mw):
+        self.middlewares.append(mw)
+
     # Replace the graceful-shutdown configuration.
     def configure_shutdown(self, ShutdownConfig cfg):
         self.shutdown = cfg
@@ -735,15 +820,41 @@ struct App:
                     r.responses.append(spec)
             i = i + 1
 
-# Construct a new application with default shutdown + docs settings.
+# Construct a new application with default shutdown + docs settings and an empty
+# middleware chain (register middleware with `app.use(...)`).
 def app() -> App:
     list[Route] rs = []
     auto st = ServerState(True, False, Stage.Running, 0)
-    return App(rs, st, default_shutdown(), default_docs())
+    list[Middleware] ms = []
+    return App(rs, st, default_shutdown(), default_docs(), ms)
 
-# Resolve a request to a response: the readiness endpoint first, then the route
-# table (404 vs 405 distinguished), then the handler. Never raises.
+# Resolve a request to a response, running the registered middleware chain around
+# the route dispatch (fastzap#2). With no middleware this is exactly
+# `_dispatch_core`; otherwise each middleware wraps the next, outermost-first (see
+# `app.use` / D-FZ-0013). This is the public entry the server and the tests call.
 def dispatch(App app, Request req) -> Response:
+    return _run_chain(app, 0, req)
+
+# Run the chain from position `i`: invoke middleware `i` with a `next` closure
+# that runs the chain from `i + 1`, and when the chain is exhausted fall through
+# to the terminal route dispatch. `next` is a first-class `fn(Request) -> Response`
+# value (a capturing lambda, zaplang-io/zap#163); reading the handle out of the
+# list element into a `fn(...)`-typed local re-attaches its signature before the
+# call. Short-circuit = a middleware returns without calling `next`.
+def _run_chain(App app, int64 i, Request req) -> Response:
+    if i < len(app.middlewares):
+        Middleware mw = app.middlewares[i]
+        fn(Request, fn(Request) -> Response) -> Response f = mw.handle
+        fn(Request) -> Response nxt = lambda r: _run_chain(app, i + 1, r)
+        return f(req, nxt)
+    return _dispatch_core(app, req)
+
+# The terminal of the middleware chain: resolve a request to a response — the
+# readiness endpoint first, then the route table (404 vs 405 distinguished), then
+# the handler. Never raises for a routing/validation outcome; a handler that
+# throws unwinds to the caller (the server's `_handle` backstop, or an
+# `error_mapper()` middleware if one is registered).
+def _dispatch_core(App app, Request req) -> Response:
     if req.path == app.shutdown.readiness_path:
         if app.state.ready:
             return json_response(200, "{\"status\":\"ready\"}")
@@ -779,6 +890,102 @@ def dispatch(App app, Request req) -> Response:
         req.params = coerced
     fn(Request) -> Response h = route.handler
     return h(req)
+
+# ---------------------------------------------------------------------------
+# Built-in middleware (fastzap#2, D-FZ-0013)
+# ---------------------------------------------------------------------------
+#
+# Each is a free-function constructor returning a `Middleware`. A fixed one uses a
+# top-level `def` as its handle; a configurable one (`request_id_header`, `cors`)
+# captures its configuration in a `lambda` (a method cannot carry config as a
+# default argument, zaplang-io/zap#481). Register them OUTERMOST-FIRST with
+# `app.use(...)` — error-mapper, then request-id, then logging, then CORS.
+
+# Catch-all error → JSON mapper. Registered OUTERMOST it wraps the whole chain:
+# any exception from an inner middleware or a handler unwinds through `next(req)`
+# to here and becomes a 500 `{"detail":"internal server error"}` — the same
+# envelope the server's connection backstop produces, now reified as a
+# composable, after-handling-aware layer. The server's `_handle` try/except
+# remains the ultimate coroutine safety net (it must never let an exception
+# escape a handler coroutine); with this registered, a handler error is mapped to
+# a Response before it ever reaches that backstop. See D-FZ-0013.
+def error_mapper() -> Middleware:
+    return middleware("error-mapper", _error_map)
+
+def _error_map(Request req, fn(Request) -> Response nxt) -> Response:
+    fn(Request) -> Response n = nxt
+    try:
+        return n(req)
+    except:
+        return json_error(500, "internal server error")
+
+# Request-id: reuse an incoming id header or generate one, make it visible to
+# downstream middleware/handlers (on the Request's header map) and echo it on the
+# Response. `request_id()` uses the conventional `X-Request-Id`.
+def request_id() -> Middleware:
+    return request_id_header("X-Request-Id")
+
+# As `request_id`, with a custom header name captured in the constructor.
+def request_id_header(str header_name) -> Middleware:
+    fn(Request, fn(Request) -> Response) -> Response h = lambda req, nxt: _request_id_apply(header_name, req, nxt)
+    return middleware("request-id", h)
+
+def _request_id_apply(
+    str header_name,
+    Request req,
+    fn(Request) -> Response nxt,
+) -> Response:
+    auto rid = req.header(header_name)
+    if rid == "":
+        rid = _gen_request_id()
+    # Expose the id to downstream middleware/handlers via the Request's
+    # lowercase-keyed header map (the convention `Request.header` reads).
+    req.headers[header_name.lower()] = rid
+    fn(Request) -> Response n = nxt
+    auto resp = n(req)
+    return with_header(resp, header_name, rid)
+
+# A generated correlation id: `req-<nanos>`, unique enough for log correlation. A
+# UUID/hex rendering is a cosmetic follow-up (needs no new capability).
+def _gen_request_id() -> str:
+    return "req-" + str(time.time_ns())
+
+# Access log: emit one line per request AFTER the handler runs — method, path and
+# the resulting status. Minimal and deterministic; per-request latency via
+# `time.monotonic_ns()` around `next` is an easy extension (left out of the
+# default so stdout stays stable for the offline golden).
+def access_log() -> Middleware:
+    return middleware("access-log", _access_log)
+
+def _access_log(Request req, fn(Request) -> Response nxt) -> Response:
+    fn(Request) -> Response n = nxt
+    auto resp = n(req)
+    print(req.method + " " + req.path + " -> " + str(resp.status))
+    return resp
+
+# CORS: decorate every response with `Access-Control-Allow-*` headers, and answer
+# a preflight `OPTIONS` directly with 204 (a short-circuit — `next` is not
+# called). `cors_default()` allows any origin (`*`); `cors(origin)` pins one.
+def cors_default() -> Middleware:
+    return cors("*")
+
+def cors(str allow_origin) -> Middleware:
+    fn(Request, fn(Request) -> Response) -> Response h = lambda req, nxt: _cors_apply(allow_origin, req, nxt)
+    return middleware("cors", h)
+
+def _cors_apply(str allow_origin, Request req, fn(Request) -> Response nxt) -> Response:
+    if req.method == "OPTIONS":
+        return _cors_headers(allow_origin, text_response(204, ""))
+    fn(Request) -> Response n = nxt
+    auto resp = n(req)
+    return _cors_headers(allow_origin, resp)
+
+def _cors_headers(str allow_origin, Response r) -> Response:
+    auto r1 = with_header(r, "Access-Control-Allow-Origin", allow_origin)
+    auto methods = "GET, POST, PUT, DELETE, PATCH, OPTIONS"
+    auto r2 = with_header(r1, "Access-Control-Allow-Methods", methods)
+    auto allow = "Content-Type, Authorization"
+    return with_header(r2, "Access-Control-Allow-Headers", allow)
 
 # ---------------------------------------------------------------------------
 # OpenAPI 3 generation + interactive docs (fastzap#3, D-FZ-0012)
@@ -1143,7 +1350,8 @@ def _collect_headers(dict[str, str] into, bytes reqh):
         i = i + 1
 
 def _write(bytes conn, Response r):
-    auto _n = net.send(conn, wire.build_response(r.status, r.content_type, r.body))
+    auto out = wire.build_response_with(r.status, r.content_type, r.body, r.headers)
+    auto _n = net.send(conn, out)
 
 def _write_safe(bytes conn, str bytes_out):
     try:

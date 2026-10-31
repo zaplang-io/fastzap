@@ -1,0 +1,23 @@
+ok chain status 200
+ok onion after-order H;B;A
+ok short-circuit status 401
+ok short-circuit skipped handler
+ok pass-through status 200
+ok pass-through ran handler
+ok request-id echoed on response
+ok request-id reaches handler
+ok request-id generated on response
+ok request-id generated reaches handler
+ok cors allow-origin present
+ok cors allow-methods present
+ok cors preflight 204
+ok cors preflight origin
+ok error mapped to 500
+ok error body is json detail
+ok error-mapper passes normal through
+GET /log -> 200
+ok access log transparent
+ok stack status 200
+ok stack has request-id
+ok stack has cors origin
+all tests passed

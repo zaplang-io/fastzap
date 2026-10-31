@@ -52,6 +52,7 @@ run_one decorator_test
 run_one di_test
 run_one params_test
 run_one openapi_test
+run_one middleware_test
 run_one shutdown_test
 
 echo "fastzap offline suite: PASS"

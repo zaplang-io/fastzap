@@ -54,10 +54,27 @@ def reason(int64 status) -> str:
 # Content-Length, Connection: close (fastzap serves one request per connection in
 # v1), then the body. Returned as a single string to hand to `net.send`.
 def build_response(int64 status, str content_type, str body) -> str:
+    dict[str, str] none = {}
+    return build_response_with(status, content_type, body, none)
+
+# As `build_response`, plus any extra response headers (fastzap#2 middleware sets
+# these — `X-Request-Id`, `Access-Control-Allow-*`). They are emitted after the
+# framework's own Content-Type/Content-Length and before Connection: close, each
+# as `Name: value\r\n`. Header map iteration order is unspecified, which is fine —
+# HTTP header order is not significant. `build_response` is this with no extras.
+def build_response_with(
+    int64 status,
+    str content_type,
+    str body,
+    dict[str, str] headers,
+) -> str:
     auto line = "HTTP/1.1 " + str(status) + " " + reason(status) + "\r\n"
     auto ct = "Content-Type: " + content_type + "\r\n"
     auto cl = "Content-Length: " + str(len(body)) + "\r\n"
-    return line + ct + cl + "Connection: close\r\n\r\n" + body
+    auto extra = ""
+    for name in headers:
+        extra = extra + name + ": " + headers[name] + "\r\n"
+    return line + ct + cl + extra + "Connection: close\r\n\r\n" + body
 
 # The path portion of a request target, i.e. everything before the first '?'.
 def target_path(str target) -> str:
