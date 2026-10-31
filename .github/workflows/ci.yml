@@ -23,6 +23,8 @@ jobs:
           test -f vendor/validation/src/validation/pattern.zap
           test -f tests/fastzap_test.zap
           test -s tests/fastzap_test.expected
+          test -f tests/decorator_test.zap
+          test -s tests/decorator_test.expected
           test -f tests/shutdown_test.zap
           test -s tests/shutdown_test.expected
           test -f examples/quickstart.zap

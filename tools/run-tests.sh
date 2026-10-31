@@ -48,6 +48,7 @@ run_one() {
 }
 
 run_one fastzap_test
+run_one decorator_test
 run_one shutdown_test
 
 echo "fastzap offline suite: PASS"
