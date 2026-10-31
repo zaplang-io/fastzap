@@ -142,6 +142,15 @@ identically to the explicit registration exercised by `tests/fastzap_test.zap`
 
 ## D-FZ-0008 — Dependency injection stays deferred
 
+> **Superseded in part by [D-FZ-0010](#d-fz-0010--dependency-injection-the-real-depends-form).**
+> The language gap this recorded — [zaplang-io/zap#466](https://github.com/zaplang-io/zap/issues/466)
+> (a reflection-driven handler adapter, D-0092) — **shipped**, so FastAPI-style
+> `Depends(...)` injection is now offered (D-FZ-0010). The other half — injecting
+> typed *path/query/body* scalars from parameter annotations (`id: int`, `q: str =
+> ...`) — still holds and is deferred to a future `@query`/`@path` source
+> annotation. The reasoning below is kept as the historical record of the v1
+> constraint and of the soundness hole ([zaplang-io/zap#465](https://github.com/zaplang-io/zap/issues/465)) found alongside it.
+
 **Decision.** FastAPI-style `Depends(...)` dependency injection and typed
 per-parameter binding (`id: int`, `q: str = ...`) are **not** offered; handlers
 remain `fn(Request) -> Response` and read typed values off the `Request`. This
@@ -169,6 +178,15 @@ an incompatible function value is accepted as a `fn(...)` with no diagnostic —
 adapter capability exists.
 
 ## D-FZ-0009 — Dependency injection: an explicit, type-safe prototype
+
+> **Superseded by [D-FZ-0010](#d-fz-0010--dependency-injection-the-real-depends-form).**
+> The `src/fastzap/di.zap` prototype (`Cell[T]`/`resolve` memo + a hand-built
+> per-request context) was a deliberate stopgap for the window before the
+> language could drive injection. [zaplang-io/zap#466](https://github.com/zaplang-io/zap/issues/466)
+> (D-0092) shipped that capability, so per our LANGUAGE-FIRST rule the workaround
+> is **retired**: `di.zap` is removed and handlers now use the real
+> `T x = Depends(provider)` form. The reasoning below is kept as the historical
+> record of the prototype and why it was explicit rather than faked.
 
 **Decision.** Ship a dependency-injection toolkit (`src/fastzap/di.zap`) that
 delivers the *semantics* of FastAPI `Depends` — **composable**, **per-request**,
@@ -207,16 +225,82 @@ are exactly the resolution substrate an adapter would call. `tests/di_test.zap`
 exercises composition (settings ← db ← principal), per-request freshness, and
 single-resolution over the real `@app.get` dispatch path.
 
+## D-FZ-0010 — Dependency injection: the real `Depends(...)` form
+
+**Supersedes [D-FZ-0009](#d-fz-0009--dependency-injection-an-explicit-type-safe-prototype)**
+(the `di.zap` prototype) and resolves the deferred half of
+[D-FZ-0008](#d-fz-0008--dependency-injection-stays-deferred).
+
+**Decision.** Adopt the idiomatic FastAPI form. A handler declares a dependency
+as a parameter with a `Depends(provider)` default:
+
+```zap
+def get_settings() -> Settings:
+    return Settings("prod")
+
+def get_db(Settings s = Depends(get_settings)) -> DB:   # nested dependency
+    return DB(s.env + "://db")
+
+@app.get("/me")
+def me(fastzap.Request req, DB db = Depends(get_db)) -> fastzap.Response:
+    return fastzap.text_response(200, db.dsn)
+```
+
+`provider` is a plain top-level `def` whose own dependencies are themselves
+`Depends(...)` parameters. The `src/fastzap/di.zap` prototype (`Cell[T]`/`resolve`
+memo + the hand-built per-request context struct) is **removed**, along with the
+manual per-request context plumbing.
+
+**Why now.** [zaplang-io/zap#466](https://github.com/zaplang-io/zap/issues/466)
+(D-0092) shipped the compiler capability D-FZ-0008 was blocked on: at the
+`@app.get` decoration site the desugar synthesizes, before sema, a per-handler
+adapter
+
+```zap
+def me$adapter(Request req) -> Response:
+    Settings get_settings$dep = get_settings()      # deps-first, once each
+    DB get_db$dep = get_db(get_settings$dep)
+    return me(req, get_db$dep)
+```
+
+whose type **is** the uniform `fn(Request) -> Response` seam, and registers *that*.
+The engine, route table, and `dispatch` are unchanged (D-FZ-0001/0007); handlers
+with no `Depends` register directly, zero overhead. Per the permanent
+LANGUAGE-FIRST rule, a workaround-shaped library migrates to the idiomatic form
+once the language fix lands — this is that migration.
+
+**Per-request caching is free.** The adapter body is the per-request scope: each
+distinct provider resolves into one local and is reused across every parameter and
+sub-dependency that needs it (FastAPI's default `use_cache=True`), with no cache
+structure and full static typing. `tests/di_test.zap`'s handler takes `get_db`
+twice (directly and via `get_user`) and the provider's "build db" token prints
+exactly once per request, proving the single resolution.
+
+**Scope boundary (v1).** The compiler binds `Depends(provider)` injection plus
+positional pass-through of the handler's non-`Depends` parameters (the `Request`)
+**only**. Path/query/body extraction stays framework-side — handlers and providers
+read typed values off `req` (`path_param_int`, `query_int`, `validate`). A provider
+parameter that is not itself `Depends(...)` is request-derived and rejected at
+compile time (`ZAP5048`). A future per-param source annotation (`@query`/`@path`)
+is a distinct capability (the still-open half of D-FZ-0008), not this decision.
+
+**Marker, not a value.** `Depends` is a compiler-recognized marker (callee name
+`Depends`, one positional provider name), consumed by the desugar and never a
+runtime value — so it is written bare, with no import. A library `Depends` value
+cannot work (the provider would be unrecoverable at the seam); see D-0092.
+
 ## Deferred to follow-up issues (against the #312 epic #432)
 
 Not blocking a coherent v1; noted so they are not forgotten:
 
 - **OpenAPI/Swagger generation** — needs schema introspection over the
   `validation` schemas + a route-table walk.
-- **Dependency injection** — an explicit, type-safe **prototype** ships
-  ([D-FZ-0009](#d-fz-0009--dependency-injection-an-explicit-type-safe-prototype));
-  the FastAPI param-injection *signature* stays blocked on zaplang-io/zap#466
-  ([D-FZ-0008](#d-fz-0008--dependency-injection-stays-deferred)).
+- **Dependency injection** — the FastAPI `Depends(...)` form **ships**
+  ([D-FZ-0010](#d-fz-0010--dependency-injection-the-real-depends-form)), now that
+  zaplang-io/zap#466 (D-0092) landed; it supersedes the `di.zap` prototype
+  (D-FZ-0009). Only typed *path/query/body* per-parameter injection (a
+  `@query`/`@path` source annotation) remains deferred — the still-open half of
+  [D-FZ-0008](#d-fz-0008--dependency-injection-stays-deferred).
 - **Middleware / filters** — a before/after chain around `dispatch`.
 - **`@app.get` decorator sugar** — **shipped**; see
   [D-FZ-0007](#d-fz-0007--app-get-decorator-routing-sugar).

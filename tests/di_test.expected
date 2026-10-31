@@ -1,9 +1,7 @@
-ok di composed graph resolves
+load settings
+build db
+ok di injected graph resolves shared
+load settings
+build db
 ok di per-request fresh scope
-ok di shared single build
-ok di same instance id
-ok di empty cell has nothing
-ok di empty cell falls back
-ok di cell has after put
-ok di cell value after put
 all tests passed

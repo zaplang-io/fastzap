@@ -1,12 +1,22 @@
-# Offline test driver for the dependency-injection prototype (fastzap#7,
-# DECISIONS.md D-FZ-0009; module src/fastzap/di.zap). Exercises the three
-# semantics FastAPI `Depends` gives — composition, per-request lifetime, and
-# shared single-resolution — over the real `@app.get` dispatch path, without a
-# socket. Each check prints a stable `ok <label>`; tools/run-tests.sh diffs
-# stdout against tests/di_test.expected.
+# Offline test driver for dependency injection (fastzap#7, DECISIONS.md
+# D-FZ-0010). Exercises the idiomatic FastAPI `Depends(...)` form now shipped by
+# the compiler (zaplang-io/zap#466, D-0092): a handler declares a dependency as a
+# parameter `T x = Depends(provider)`, and the `@app.get` desugar synthesizes a
+# per-handler adapter that resolves providers (deps-first, once per request) and
+# injects them — all over the real `@app.get` dispatch path, without a socket.
+#
+# Three properties are proven, every one observable in stdout (providers print a
+# token when their body actually runs; tools/run-tests.sh diffs stdout against
+# tests/di_test.expected):
+#   * injection + nesting — `me` gets a resolved `Principal`/`DB`; `get_db`'s own
+#     `Settings` dependency is itself a `Depends(...)` parameter, resolved first;
+#   * deps-first order — "load settings" prints before "build db" each request;
+#   * per-request single-resolution — `me` takes `get_db` twice (directly and via
+#     `get_user`), yet "build db" prints exactly once per request (FastAPI's
+#     default `use_cache=True`), and a second request resolves afresh (per-request
+#     lifetime), so the tokens repeat rather than leaking a cached value.
 
 import fastzap
-import fastzap.di
 
 def check(str label, bool cond):
     if cond:
@@ -21,85 +31,51 @@ struct Settings:
 
 struct DB:
     str dsn
-    int64 id
 
 struct Principal:
     str who
     str dsn
 
-# One Cell per shared dependency, plus a build counter that proves the DB
-# provider runs exactly once per request (shared resolution).
-struct Ctx:
-    di.Cell[Settings] settings
-    di.Cell[DB] db
-    di.Cell[Principal] user
-    di.Cell[int64] db_builds
+# Leaf provider: no dependencies of its own.
+def get_settings() -> Settings:
+    print("load settings")
+    return Settings("prod")
 
-def fresh_ctx() -> Ctx:
-    return Ctx(
-        di.new_cell[Settings](),
-        di.new_cell[DB](),
-        di.new_cell[Principal](),
-        di.new_cell[int64](),
-    )
+# Nested: `get_db` depends on `get_settings`, declared as a `Depends(...)`
+# parameter. The adapter resolves `get_settings` first and passes it in. The
+# "build db" print proves the body runs — exactly once per request.
+def get_db(Settings s = Depends(get_settings)) -> DB:
+    print("build db")
+    return DB(s.env + "://db")
 
-# Leaf dependency.
-def get_settings(Ctx c) -> Settings:
-    return di.resolve(c.settings, lambda: Settings("prod"))
-
-# Composes on settings; bumps db_builds each time the provider body runs.
-def build_db(Ctx c) -> DB:
-    auto s = get_settings(c)
-    auto prev = di.cell_or(c.db_builds, 0)
-    di.cell_put(c.db_builds, prev + 1)
-    return DB(s.env + "://db", prev + 1)
-
-def get_db(Ctx c) -> DB:
-    return di.resolve(c.db, lambda: build_db(c))
-
-# Composes on db (two levels deep).
-def get_user(Ctx c) -> Principal:
-    return di.resolve(c.user, lambda: Principal("alice", get_db(c).dsn))
+# Two levels deep: `get_user` depends on `get_db` (which depends on settings).
+def get_user(DB db = Depends(get_db)) -> Principal:
+    return Principal("alice", db.dsn)
 
 # --- a handler that opts into DI, registered with the @app.get sugar --------
-
+#
+# `me` needs `get_db` twice: directly (`db`) and transitively through `user`.
+# Per-request caching resolves `get_db` (and its `get_settings`) once and shares
+# the result, so `user.dsn == db.dsn` and the provider bodies run a single time.
 @app.get("/me")
-def me(fastzap.Request req) -> fastzap.Response:
-    auto c = fresh_ctx()
-    auto user = get_user(c)  # resolves user -> db -> settings
-    auto db = get_db(c)  # SHARED: cache hit, build_db does NOT run again
-    auto builds = di.cell_or(c.db_builds, 0)
-    return fastzap.text_response(
-        200,
-        user.who + ";" + db.dsn + ";builds=" + str(builds),
-    )
+def me(
+    fastzap.Request req,
+    Principal user = Depends(get_user),
+    DB db = Depends(get_db),
+) -> fastzap.Response:
+    return fastzap.text_response(200, user.who + ";" + user.dsn + ";" + db.dsn)
 
 def main():
     auto app = fastzap.app()
 
-    # Over the real dispatch path: the composed graph resolves and db builds once.
+    # Injection + nesting + single-resolution: the composed graph resolves over
+    # the real dispatch path; both `get_db` uses see one shared DB (builds once).
     auto r1 = fastzap.dispatch(app, fastzap.request("GET", "/me", ""))
-    check("di composed graph resolves", r1.body == "alice;prod://db;builds=1")
+    check("di injected graph resolves shared", r1.body == "alice;prod://db;prod://db")
 
-    # Per-request lifetime: a second request gets a fresh scope — db builds again
-    # (count resets to 1), it is not leaked from the first request.
+    # Per-request lifetime: a second request gets a fresh scope — the providers
+    # run again (the tokens repeat), nothing is leaked from the first request.
     auto r2 = fastzap.dispatch(app, fastzap.request("GET", "/me", ""))
-    check("di per-request fresh scope", r2.body == "alice;prod://db;builds=1")
-
-    # Shared single-resolution, inspected directly: two get_db calls on one
-    # context resolve the DB provider exactly once.
-    auto c = fresh_ctx()
-    auto a = get_db(c)
-    auto b = get_db(c)
-    check("di shared single build", di.cell_or(c.db_builds, 0) == 1)
-    check("di same instance id", a.id == b.id)
-
-    # The closure-free check/put form of a cell.
-    di.Cell[int64] cnt = di.new_cell[int64]()
-    check("di empty cell has nothing", not di.cell_has(cnt))
-    check("di empty cell falls back", di.cell_or(cnt, 7) == 7)
-    di.cell_put(cnt, 5)
-    check("di cell has after put", di.cell_has(cnt))
-    check("di cell value after put", di.cell_value(cnt) == 5)
+    check("di per-request fresh scope", r2.body == "alice;prod://db;prod://db")
 
     print("all tests passed")
