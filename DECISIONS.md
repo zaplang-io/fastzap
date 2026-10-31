@@ -6,6 +6,15 @@ cross-referenced from the source. Language-level decisions live in the zap repo'
 
 ## D-FZ-0001 — Method-call routing, not the `@app.get` decorator
 
+> **Superseded by [D-FZ-0007](#d-fz-0007--app-get-decorator-routing-sugar).** The
+> `@app.get("/path")` decorator surface IS now offered — the language support it
+> was blocked on (zaplang-io/zap#457 / D-0087) shipped. The method-call form below
+> remains the registration seam the decorator lowers to (and is still available
+> for programmatic registration); only the **recommended surface** changed. The
+> reasoning below is kept as the historical record of the v1 constraint. The
+> second half — no per-parameter injection — still holds and is now tracked
+> precisely in [D-FZ-0008](#d-fz-0008--dependency-injection-stays-deferred).
+
 **Decision.** Routes are registered with method calls — `app.get("/items/{id}",
 handler)`, `app.post(...)`, etc. — with a single uniform handler signature
 `fn(Request) -> Response`. The literal FastAPI `@app.get("/items/{id}")` decorator
@@ -94,15 +103,83 @@ read and write, so for a cap-1, signal-driven, one-shot drain plain flags are
 correct. Promoting `ready`/`active` to atomic types is a clean follow-up if the
 scheduler ever becomes preemptive within these windows.
 
+## D-FZ-0007 — `@app.get` decorator routing sugar
+
+**Decision.** Routes are declared FastAPI-style with the `@app.get("/path")` /
+`@app.post(...)` / `@app.put` / `@app.delete` / `@app.patch` decorator on a
+handler `def`. This **supersedes [D-FZ-0001](#d-fz-0001--method-call-routing-not-the-appget-decorator)**'s
+"not offered in v1". The engine, the `Route` table and `dispatch` are
+**unchanged** — this is pure surface sugar.
+
+**How it lowers (zaplang-io/zap#457, D-0087).** A *dotted* decorator name is a
+registering callable target: `@app.get("/path")` on `def h(Request) -> Response`
+desugars — whole-program, **before sema** — to the method-call registration the
+engine already runs, `app.get("/path", h)`, spliced in **immediately after the
+receiver's binding** (`auto app = fastzap.app()`) in declared-`def` **source
+order**. `h` is passed as a first-class `fn(Request) -> Response` value (D-0067).
+Because the desugar runs before sema, the resulting call is fully type-checked:
+an unknown receiver, a missing method, or a wrong handler shape is a precise
+error at the call. Confirmed on `zap ir` + `zap expand` against the real fastzap
+modules: the 5 decorators in `tests/decorator_test.zap` splice into `main` as
+`App__get/App__post/App__delete(...)` in order.
+
+**Constraints this inherits (D-0087 "capability A").**
+- The handler is the single uniform signature `fn(Request) -> Response`; typed
+  values are pulled off the `Request` inside it (`path_param_int`, `query_int`,
+  `validate`). Per-parameter typed injection is **not** part of this — see
+  D-FZ-0008.
+- The receiver must be a local named as the decorator's prefix (`app`) and the
+  decorated handlers are module-level `def`s — the arrangement D-0087/D-0090
+  require (the registration lives in `def main()`; top-level executable
+  statements are an error). The method-call form stays available for
+  programmatic/dynamic registration (loops, computed paths) where a static
+  decorator cannot be written.
+
+**Surface.** `examples/quickstart.zap` and the module header now use the
+decorator form; `tests/decorator_test.zap` proves decorated routes dispatch
+identically to the explicit registration exercised by `tests/fastzap_test.zap`
+(same engine, same golden-style `ok <label>` assertions).
+
+## D-FZ-0008 — Dependency injection stays deferred
+
+**Decision.** FastAPI-style `Depends(...)` dependency injection and typed
+per-parameter binding (`id: int`, `q: str = ...`) are **not** offered; handlers
+remain `fn(Request) -> Response` and read typed values off the `Request`. This
+replaces D-FZ-0001's vague "gated on the same reflection gap" with a precise
+blocker. It is **not** `@app.get` sugar (that shipped, D-FZ-0007) and **not** the
+stale `#16` the issues cited.
+
+**Why — reflection is necessary but not sufficient.** zaplang-io/zap#458 / D-0089
+shipped parameter reflection as the intended substrate, but it only *describes* a
+signature; it cannot *drive* injection:
+1. The `@app.get` seam passes an opaque `fn` **value**; reflection is keyed by the
+   function **name** and D-0089 states fn values are not reflectable by value, so
+   there is no name to query at registration/dispatch.
+2. `reflect_param_annotations` returns annotation **names** only — a
+   `Depends(get_db)` provider argument is unrecoverable.
+3. Dispatch is the uniform `h(request)`; there is no way to invoke a differently
+   shaped handler with reflectively-resolved arguments.
+
+Realizing it needs the "reflection-driven adapter" D-0089 itself defers
+(compiler-generated per-handler glue that binds each declared param per request,
+with `Depends` composition + per-request caching). Filed as a language gap:
+**zaplang-io/zap#466**. A related soundness hole found while building D-FZ-0007 —
+an incompatible function value is accepted as a `fn(...)` with no diagnostic — is
+**zaplang-io/zap#465**. fastzap#7 is blocked on #466 (not #16); it lands when the
+adapter capability exists.
+
 ## Deferred to follow-up issues (against the #312 epic #432)
 
 Not blocking a coherent v1; noted so they are not forgotten:
 
 - **OpenAPI/Swagger generation** — needs schema introspection over the
   `validation` schemas + a route-table walk.
-- **Dependency injection** — gated on the same reflection gap as D-FZ-0001.
+- **Dependency injection** — now precisely blocked; see
+  [D-FZ-0008](#d-fz-0008--dependency-injection-stays-deferred) and
+  zaplang-io/zap#466.
 - **Middleware / filters** — a before/after chain around `dispatch`.
-- **`@app.get` decorator sugar** — gated on decorator-codegen (#16).
+- **`@app.get` decorator sugar** — **shipped**; see
+  [D-FZ-0007](#d-fz-0007--app-get-decorator-routing-sugar).
 - **HTTPS/TLS termination** — the stdlib `http`/`net` is plaintext in v1; TLS
   (#147) is a follow-up.
 - **Keep-alive / streaming bodies** — v1 is one request per connection

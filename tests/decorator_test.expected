@@ -1,0 +1,13 @@
+ok decorator registered all routes
+ok decorated root status
+ok decorated root body
+ok decorated path param status
+ok decorated path param captured
+ok decorated query parsed
+ok decorated post valid is 201
+ok decorated post echoes name
+ok decorated post invalid is 422
+ok decorated unknown path is 404
+ok decorated wrong method is 405
+ok decorated delete status
+all tests passed

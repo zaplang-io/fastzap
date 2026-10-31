@@ -24,6 +24,7 @@
 #           validation.field("price", validation.float_t(min=0.0)),
 #       ])
 #
+#   @app.post("/items")
 #   def create_item(fastzap.Request req) -> fastzap.Response:
 #       match req.validate(item_schema()):
 #           case validation.ValidationResult.Ok(m):
@@ -31,27 +32,33 @@
 #           case validation.ValidationResult.Err(errs):
 #               return fastzap.validation_error(errs)
 #
+#   @app.get("/items/{id}")
 #   def read_item(fastzap.Request req) -> fastzap.Response:
 #       auto id = req.path_param_int("id", 0)
 #       return fastzap.json_response(200, "{\"id\":" + str(id) + "}")
 #
 #   def main():
-#       auto app = fastzap.app()
-#       app.get("/items/{id}", read_item)
-#       app.post("/items", create_item)
+#       auto app = fastzap.app()   # the `@app.*` routes register right here
 #       fastzap.run(app, "0.0.0.0", 8000)
 #
-# ROUTING SURFACE — why method-call registration, not `@app.get`:
-# FastAPI registers routes with a decorator that *reads the handler's parameter
-# annotations* to inject typed path/query/body params. Zap's user-defined
-# function decorators are deferred (zaplang-io/zap#26/#16: only `@derive` and
-# struct reflection exist today) and there is no function-parameter reflection,
-# so neither the `@app.get("/x")` form nor per-parameter injection can exist yet.
-# fastzap therefore uses method-call registration — `app.get("/x", handler)` —
-# with a single uniform handler signature `fn(Request) -> Response`, and the
-# handler pulls typed values off the Request (`path_param_int`, `query_int`,
-# `validate`). This is the exact shape a future `@app.get` would lower to once
-# decorator-codegen lands; see DECISIONS.md (D-FZ-0001).
+# ROUTING SURFACE — the `@app.get` decorator (fastzap#8, D-FZ-0007):
+# Routes are declared FastAPI-style with `@app.get("/x")` / `@app.post(...)` on a
+# handler `def`. A dotted decorator is pure sugar (zaplang-io/zap#457, D-0087): it
+# desugars — whole-program, before sema — to the method-call registration the
+# engine already runs, `app.get("/x", handler)`, spliced in immediately after the
+# receiver's binding (`auto app = fastzap.app()`) in declared-def source order.
+# The engine, the route table and `dispatch` are UNCHANGED; the method-call form
+# (`App.get/post/...` below) is the seam the decorator lowers to and remains
+# available for programmatic registration.
+#
+# The handler is a single uniform signature `fn(Request) -> Response`; typed
+# values are pulled off the Request (`path_param_int`, `query_int`, `validate`).
+# FastAPI-style per-parameter injection (`id: int`, `q: str = ...`) and
+# `Depends(...)` dependency injection are NOT offered: they need a reflection-
+# driven adapter that binds a handler's declared params per request, which the
+# current language primitives cannot express (zaplang-io/zap#458/D-0089 reflection
+# is descriptive-only and name-keyed, and the dispatch seam holds opaque fn
+# values). Tracked as a language gap; see DECISIONS.md (D-FZ-0007, D-FZ-0008).
 #
 # NOTE: Zap's `and`/`or` do not short-circuit today (both operands are always
 # evaluated, zaplang-io/zap), so this module never guards an index/lookup with a

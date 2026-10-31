@@ -28,13 +28,21 @@ def item_schema() -> validation.Schema:
         ],
     )
 
+# Routes are declared with the `@app.get` / `@app.post` decorator sugar
+# (fastzap#8, DECISIONS.md D-FZ-0007): each decorator desugars to the method-call
+# registration `app.<method>(path, handler)` the engine runs, spliced in right
+# after `auto app = fastzap.app()` below. The handler stays a plain function
+# `fn(Request) -> Response`; typed values are pulled off the Request inside it.
+@app.get("/")
 def index(fastzap.Request req) -> fastzap.Response:
     return fastzap.json_response(200, "{\"service\":\"items\",\"status\":\"ok\"}")
 
+@app.get("/items")
 def list_items(fastzap.Request req) -> fastzap.Response:
     auto limit = req.query_int("limit", 10)
     return fastzap.json_response(200, "{\"limit\":" + str(limit) + "}")
 
+@app.get("/items/{id}")
 def read_item(fastzap.Request req) -> fastzap.Response:
     auto id = req.path_param_int("id", 0)
     dict[str, JsonValue] o = {}
@@ -44,6 +52,7 @@ def read_item(fastzap.Request req) -> fastzap.Response:
 
 # A typed POST handler: validate the body into a model, or return 422 with the
 # full list of field errors (this is pydantic's role, played by `validation`).
+@app.post("/items")
 def create_item(fastzap.Request req) -> fastzap.Response:
     match req.validate(item_schema()):
         case validation.ValidationResult.Ok(m):
@@ -52,11 +61,10 @@ def create_item(fastzap.Request req) -> fastzap.Response:
             return fastzap.validation_error(errs)
 
 def main():
+    # The `@app.get`/`@app.post` registrations above are spliced in here, right
+    # after this binding, in source order — equivalent to calling
+    # `app.get("/", index)`, `app.get("/items", list_items)`, etc. by hand.
     auto app = fastzap.app()
-    app.get("/", index)
-    app.get("/items", list_items)
-    app.get("/items/{id}", read_item)
-    app.post("/items", create_item)
 
     # Tune the staged drain for a fast-rolling deployment: keep serving 3s into
     # the endpoint-propagation window, then up to 20s of in-flight drain — a 23s

@@ -11,7 +11,8 @@ the architecture and the reasoning; the user-facing surface is in the
 Dogfoods Zap-to-Zap module imports (D-0081, zaplang-io/zap#283):
 
 ```
-src/fastzap.zap        public API: Request/Response, App + routing registration,
+src/fastzap.zap        public API: Request/Response, App + routing registration
+                       (the `@app.get` decorator desugars to it, D-FZ-0007),
                        the route matcher, the coroutine server + staged shutdown,
                        the response builders, and the validation bridge.
 src/fastzap/wire.zap   a self-contained HTTP/1.1 wire + URL helper: request-target
@@ -135,6 +136,12 @@ while authoring — every `.zap` here was checked with a front-end-only `zap`
   params, trailing-slash, 404 vs 405), query parsing (defaults, `+`/%XX
   decoding), the readiness endpoint, the response builders, the validation bridge
   (201 and 422), and the wire serialization. Fully deterministic.
+- `tests/decorator_test.zap` — the `@app.get` routing sugar (D-FZ-0007): the
+  handlers are registered **only** by `@app.get`/`@app.post`/`@app.delete`
+  decorators (no explicit `app.<verb>(...)` call in the file), and the driver
+  asserts the route table was populated and dispatches identically to the engine
+  that `fastzap_test.zap` drives by hand — proving the decorator is pure sugar
+  over the same registration.
 - `tests/shutdown_test.zap` — the staged drain over the **real signal path**:
   `signal.notify(SIGTERM)` + `__raise_signal(15)` + `__signal_drain()` deliver
   the signal deterministically (exactly as the compiler's own signal goldens do),

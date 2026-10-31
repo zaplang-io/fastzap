@@ -33,10 +33,12 @@ def item_schema() -> validation.Schema:
         validation.field("price", validation.float_t(min=0.0)),
     ])
 
+@app.get("/items/{id}")
 def read_item(fastzap.Request req) -> fastzap.Response:
     auto id = req.path_param_int("id", 0)
     return fastzap.json_response(200, "{\"id\":" + str(id) + "}")
 
+@app.post("/items")
 def create_item(fastzap.Request req) -> fastzap.Response:
     match req.validate(item_schema()):
         case validation.ValidationResult.Ok(m):
@@ -45,9 +47,7 @@ def create_item(fastzap.Request req) -> fastzap.Response:
             return fastzap.validation_error(errs)  # 422, every field error listed
 
 def main():
-    auto app = fastzap.app()
-    app.get("/items/{id}", read_item)
-    app.post("/items", create_item)
+    auto app = fastzap.app()   # the `@app.*` routes above register right here
     fastzap.run(app, "0.0.0.0", 8000)
 ```
 
@@ -55,16 +55,33 @@ A complete, runnable version is in [`examples/quickstart.zap`](examples/quicksta
 
 ## Routing
 
-Register a handler for a method + path template. Path parameters are written
-`{name}` and captured into the request:
+Declare a handler for a method + path template with the `@app.<verb>` decorator.
+Path parameters are written `{name}` and captured into the request:
 
 ```zap
-app.get("/", index)
-app.get("/users/{uid}/posts/{pid}", read_post)
+@app.get("/")
+def index(fastzap.Request req) -> fastzap.Response: ...
+
+@app.get("/users/{uid}/posts/{pid}")
+def read_post(fastzap.Request req) -> fastzap.Response: ...
+
+@app.post("/items")
+def create_item(fastzap.Request req) -> fastzap.Response: ...
+
+@app.put("/items/{id}")
+def replace_item(fastzap.Request req) -> fastzap.Response: ...
+# ...and @app.delete / @app.patch likewise.
+```
+
+Each `@app.<verb>("/path")` is sugar for the method-call registration
+`app.<verb>("/path", handler)`, spliced in right after `auto app = fastzap.app()`
+in source order (zaplang-io/zap#457, D-0087). The method-call form stays
+available for programmatic registration (loops, computed paths):
+
+```zap
+auto app = fastzap.app()
+app.get("/", index)              # equivalent to @app.get("/") on `index`
 app.post("/items", create_item)
-app.put("/items/{id}", replace_item)
-app.delete("/items/{id}", delete_item)
-app.patch("/items/{id}", patch_item)
 ```
 
 Every handler has the same signature, `fn(Request) -> Response`, and pulls typed
@@ -83,16 +100,16 @@ values off the request:
 Unknown paths return `404`; a known path reached with the wrong method returns
 `405`.
 
-> **Why `app.get("/x", handler)` and not the `@app.get("/x")` decorator?**
-> FastAPI's decorator reads a handler's *parameter annotations* to inject typed
-> path/query/body params. Zap's user-defined function decorators are deferred
-> (zaplang-io/zap#26/#16 — only `@derive` and struct reflection exist today) and
-> there is no function-parameter reflection, so neither the decorator form nor
-> per-parameter injection can exist yet. fastzap keeps the rest of the FastAPI
-> shape — one app object, method-per-verb registration, typed models, a value
-> return — and this registration call is exactly what a future `@app.get` will
-> lower to once decorator-codegen lands. See [DECISIONS.md](DECISIONS.md)
-> (D-FZ-0001).
+> **What the decorator does _not_ do yet: per-parameter injection.**
+> FastAPI's decorator also reads a handler's *parameter annotations* to inject
+> typed path/query/body params and `Depends(...)` dependencies. fastzap's
+> `@app.get` is routing sugar only — the handler stays `fn(Request) -> Response`
+> and pulls typed values off the `Request` itself. Per-parameter injection and
+> `Depends` need a reflection-driven adapter the language can't express yet
+> (parameter reflection exists but is descriptive-only and name-keyed, while the
+> dispatch seam holds opaque function values); tracked at
+> [zaplang-io/zap#466](https://github.com/zaplang-io/zap/issues/466). See
+> [DECISIONS.md](DECISIONS.md) (D-FZ-0007, D-FZ-0008).
 
 ## Typed models
 
@@ -181,15 +198,16 @@ and what is CI-verified.
 
 ## v1 scope
 
-**In v1:** decorator-style method routing with path params, typed
+**In v1:** `@app.get` decorator routing with path params (D-FZ-0007), typed
 request/response models via `validation`, the built-in coroutine HTTP server,
 per-request structured-concurrency scopes, and the staged graceful shutdown, with
 tests and a runnable example.
 
 **Deferred follow-ups** (tracked against the #312 epic #432): OpenAPI/Swagger
-generation, dependency injection, middleware/filters, the `@app.get` decorator
-sugar (awaits decorator-codegen #16), HTTPS/TLS termination, and keep-alive /
-streaming bodies. See [DECISIONS.md](DECISIONS.md).
+generation, dependency injection + typed per-parameter injection (`Depends`;
+blocked on [zaplang-io/zap#466](https://github.com/zaplang-io/zap/issues/466), see
+D-FZ-0008), middleware/filters, HTTPS/TLS termination, and keep-alive / streaming
+bodies. See [DECISIONS.md](DECISIONS.md).
 
 ## License
 
