@@ -19,12 +19,15 @@ jobs:
           test -f zap.toml
           test -f src/fastzap.zap
           test -f src/fastzap/wire.zap
+          test -f src/fastzap/di.zap
           test -f vendor/validation/src/validation.zap
           test -f vendor/validation/src/validation/pattern.zap
           test -f tests/fastzap_test.zap
           test -s tests/fastzap_test.expected
           test -f tests/decorator_test.zap
           test -s tests/decorator_test.expected
+          test -f tests/di_test.zap
+          test -s tests/di_test.expected
           test -f tests/shutdown_test.zap
           test -s tests/shutdown_test.expected
           test -f examples/quickstart.zap
