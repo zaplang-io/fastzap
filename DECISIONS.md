@@ -107,3 +107,12 @@ Not blocking a coherent v1; noted so they are not forgotten:
   (#147) is a follow-up.
 - **Keep-alive / streaming bodies** — v1 is one request per connection
   (`Connection: close`).
+- **Strict typed-param coercion (422 on unparsable)** — v1's `req.query_int(name,
+  fallback)` / `path_param_int(name, fallback)` return the caller-supplied default
+  on unparsable input (the method's contract — there is no auto param injection,
+  D-FZ-0001). A strict variant that rejects an unparsable typed path/query param
+  with a 422 (FastAPI's behavior) is a follow-up, landing naturally alongside the
+  parameter-injection path once decorator-codegen/reflection exist. (Note: `int()`
+  on a non-numeric string is an *uncatchable* fault in the toolchain today, so the
+  coercion pre-validates the string rather than catching a failure; tracked as a
+  zap-language issue, not a fastzap one.)
