@@ -27,6 +27,8 @@ jobs:
           test -s tests/decorator_test.expected
           test -f tests/di_test.zap
           test -s tests/di_test.expected
+          test -f tests/params_test.zap
+          test -s tests/params_test.expected
           test -f tests/shutdown_test.zap
           test -s tests/shutdown_test.expected
           test -f examples/quickstart.zap

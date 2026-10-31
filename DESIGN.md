@@ -51,8 +51,12 @@ For each accepted connection, in its own coroutine (`_handle`):
    route's precomputed segments; a `{name}` segment captures into `path_params`.
    A path that matches no route is `404`; a path that matches but with the wrong
    method is `405`.
-4. The matched handler runs. Typed-model work (`req.validate(schema)`) is done by
-   the `validation` package inside the handler.
+4. If the matched route declares param specs (`app.with_params(...)`, D-FZ-0011),
+   `dispatch` validates and coerces them off the `Request` first; a missing
+   required or unparsable typed value short-circuits to a `422` before the handler
+   runs. The matched handler then runs — reading coerced values off `req.param_*`
+   and doing typed-model work (`req.validate(schema)`) via the `validation`
+   package inside the handler.
 5. The `Response` is serialized by `wire.build_response` and written with
    `net.send`, then the connection is closed.
 
@@ -148,6 +152,13 @@ while authoring — every `.zap` here was checked with a front-end-only `zap`
   injection + nesting, deps-first resolution order, and per-request
   single-resolution (providers print a token, so "build db" appears once per
   request even though the handler takes `get_db` twice).
+- `tests/params_test.zap` — strict typed-param coercion (D-FZ-0011): a route
+  declares param specs with `app.with_params(...)` (composing with both the
+  `@app.get` decorator and programmatic registration), and the driver asserts a
+  valid request coerces int/str/bool (incl. an applied default), a missing
+  required param and an unparsable int/bool each produce a field-located 422,
+  multiple failures collect into one 422, and the lenient `query_int(name,
+  fallback)` accessor is unchanged on a route that declares no specs.
 - `tests/shutdown_test.zap` — the staged drain over the **real signal path**:
   `signal.notify(SIGTERM)` + `__raise_signal(15)` + `__signal_drain()` deliver
   the signal deterministically (exactly as the compiler's own signal goldens do),

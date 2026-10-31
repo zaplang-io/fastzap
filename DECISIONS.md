@@ -289,6 +289,84 @@ is a distinct capability (the still-open half of D-FZ-0008), not this decision.
 runtime value — so it is written bare, with no import. A library `Depends` value
 cannot work (the provider would be unrecoverable at the seam); see D-0092.
 
+## D-FZ-0011 — Strict typed-param coercion + explicit param specs
+
+**Decision.** Add a **strict** typed-param path alongside the lenient accessors. A
+route declares its parameters as structured **specs** — `(name, location, type,
+required, default, description)` — and `dispatch` validates and coerces them off
+the `Request` **before** the handler runs. A missing required param or an
+unparsable typed value collects a field-located error and short-circuits to a
+**422**; on success the handler reads coerced values off the Request. This is the
+follow-up [D-FZ-0001](#d-fz-0001--method-call-routing-not-the-appget-decorator)
+and the deferred list recorded, now buildable because explicit declaration
+sidesteps the missing per-parameter source annotation (the open half of
+[D-FZ-0008](#d-fz-0008--dependency-injection-stays-deferred)).
+
+**Surface.** A spec is built with `path_param_spec(name, type, description="")`
+(path params are required by construction), `query_param_spec(name, type,
+required=True, description="")`, or `query_param_default(name, type, default,
+description="")` (optional with an applied default). `type` is
+`ParamType.IntT | StrT | BoolT`. Specs attach to an already-registered route with
+`app.with_params(method, path, specs)`:
+
+```zap
+@app.get("/items/{id}")
+def read_item(fastzap.Request req) -> fastzap.Response:
+    return fastzap.json_response(200, "{\"id\":" + str(req.param_int("id")) + "}")
+
+def main():
+    auto app = fastzap.app()                       # @app.get splices app.get(...) here
+    app.with_params("GET", "/items/{id}", [
+        fastzap.path_param_spec("id", fastzap.ParamType.IntT),
+    ])
+    app.with_params("GET", "/search", [
+        fastzap.query_param_spec("q", fastzap.ParamType.StrT),
+        fastzap.query_param_default("n", fastzap.ParamType.IntT, "10"),
+    ])
+    fastzap.run(app, "0.0.0.0", 8000)
+```
+
+**Why a post-registration `with_params`, not a new registration verb.** The
+`@app.get` desugar (D-FZ-0007) emits *only* `app.get("/path", handler)` — specs
+cannot ride on the decorator. A declarative *attach* keyed by method + path
+decouples specs from registration, so one surface serves both decorated and
+programmatic routes, and the decorator stays untouched. The desugar splices the
+`app.get(...)` calls in immediately after `auto app = fastzap.app()`, so the route
+already exists when `with_params` runs later in `main`.
+
+**Error shape — reuse `validation.ValErr`.** Each failure is a
+`validation.ValErr(loc, kind, msg)` with a dotted location (`"query.n"`,
+`"path.id"` — the package's `"address.zip"` convention), a machine `kind`
+(`"missing"`, `"int_parsing"`, `"bool_parsing"`), and a human `msg`. The 422 is
+rendered by the **existing** `validation_error(errs)` envelope, identical to body
+validation, and **all** failures are collected (not just the first), matching
+FastAPI's 422 list.
+
+**Coercion + the uncatchable-fault constraint.** `IntT` reuses the v1 `_is_int_str`
+pre-check before calling `int()` — `int()` on a non-numeric string is an
+*uncatchable* toolchain fault (zaplang-io/zap ~#456), so the string is validated
+first, never caught. `BoolT` accepts `true`/`false`/`1`/`0` case-insensitively;
+`StrT` always succeeds. Coerced values land in a `dict[str, JsonValue]` bag on the
+`Request`, read via `param_int` / `param_str` / `param_bool` (present-and-typed
+accessors, like `validation.Model`'s getters).
+
+**Lenient accessors unchanged.** `query_int(name, fallback)` /
+`path_param_int(name, fallback)` keep their default-on-unparsable contract — strict
+is a *variant alongside*, opt-in per route, not a replacement.
+
+**Scope (D-0092 boundary).** This is framework-side coercion off the Request; it
+does **not** go through the compiler's `Depends(...)` injection adapter
+(zaplang-io/zap#466). A per-parameter `@query`/`@path` source annotation that would
+inject coerced scalars into handler parameters is a separate, still-unbuilt
+capability (the open half of D-FZ-0008) — this spec surface is the bridge toward
+it and, meanwhile, the structured input OpenAPI parameter docs read from.
+
+**Feeds OpenAPI (fastzap#3).** `Route.params` is an ordered `list[ParamSpec]`
+carrying exactly the OpenAPI Parameter Object fields (`name`, `in` = path/query,
+`required`, `schema` type, `default`, `description`). fastzap#3 generates a path
+item's `parameters:` by walking `route.params` — no second declaration, and the
+`description` slot is already present for doc text.
+
 ## Deferred to follow-up issues (against the #312 epic #432)
 
 Not blocking a coherent v1; noted so they are not forgotten:
@@ -308,12 +386,11 @@ Not blocking a coherent v1; noted so they are not forgotten:
   (#147) is a follow-up.
 - **Keep-alive / streaming bodies** — v1 is one request per connection
   (`Connection: close`).
-- **Strict typed-param coercion (422 on unparsable)** — v1's `req.query_int(name,
-  fallback)` / `path_param_int(name, fallback)` return the caller-supplied default
-  on unparsable input (the method's contract — there is no auto param injection,
-  D-FZ-0001). A strict variant that rejects an unparsable typed path/query param
-  with a 422 (FastAPI's behavior) is a follow-up, landing naturally alongside the
-  parameter-injection path once decorator-codegen/reflection exist. (Note: `int()`
-  on a non-numeric string is an *uncatchable* fault in the toolchain today, so the
-  coercion pre-validates the string rather than catching a failure; tracked as a
-  zap-language issue, not a fastzap one.)
+- **Strict typed-param coercion (422 on unparsable)** — **shipped** via an
+  explicit param-spec surface; see
+  [D-FZ-0011](#d-fz-0011--strict-typed-param-coercion--explicit-param-specs). The
+  lenient `query_int(name, fallback)` / `path_param_int(name, fallback)` default-on-
+  unparsable contract is kept alongside it. The remaining piece — a per-parameter
+  `@query`/`@path` source annotation that injects coerced scalars into *handler
+  parameters* through the #466 adapter — stays deferred (the open half of
+  D-FZ-0008).

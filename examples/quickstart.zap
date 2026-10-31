@@ -4,8 +4,9 @@
 #   (assembled next to the library by tools/build-examples.sh)
 #   zap run quickstart.zap
 #   curl localhost:8000/                       # service banner
-#   curl localhost:8000/items/42               # a path parameter
-#   curl 'localhost:8000/items?limit=5'        # a query parameter
+#   curl localhost:8000/items/42               # a strict typed path parameter
+#   curl localhost:8000/items/abc              # 422 (not a valid integer)
+#   curl 'localhost:8000/items?limit=5'        # a lenient query parameter
 #   curl localhost:8000/db                     # a Depends(...) injected dependency
 #   curl -XPOST localhost:8000/items -d '{"name":"Book","price":9.5}'   # 201
 #   curl -XPOST localhost:8000/items -d '{"name":"","price":-1}'        # 422
@@ -38,14 +39,18 @@ def item_schema() -> validation.Schema:
 def index(fastzap.Request req) -> fastzap.Response:
     return fastzap.json_response(200, "{\"service\":\"items\",\"status\":\"ok\"}")
 
+# Lenient: an absent/garbage `limit` falls back to 10 (never a 422).
 @app.get("/items")
 def list_items(fastzap.Request req) -> fastzap.Response:
     auto limit = req.query_int("limit", 10)
     return fastzap.json_response(200, "{\"limit\":" + str(limit) + "}")
 
+# Strict: `id` is declared an int param (see `with_params` in `main`), so a
+# non-integer path segment is rejected with a 422 BEFORE this runs — here the
+# coerced value is read straight off the Request with `param_int`.
 @app.get("/items/{id}")
 def read_item(fastzap.Request req) -> fastzap.Response:
-    auto id = req.path_param_int("id", 0)
+    auto id = req.param_int("id")
     dict[str, JsonValue] o = {}
     o["id"] = JsonValue.Int(id)
     o["name"] = JsonValue.Str("item-" + str(id))
@@ -88,6 +93,17 @@ def main():
     # after this binding, in source order — equivalent to calling
     # `app.get("/", index)`, `app.get("/items", list_items)`, etc. by hand.
     auto app = fastzap.app()
+
+    # Strict typed-param coercion (fastzap#4, D-FZ-0011): declare `/items/{id}`'s
+    # `id` as an int param. `dispatch` coerces it off the Request before the
+    # handler and returns a field-located 422 on a non-integer segment. Specs are
+    # attached post-registration, so they compose with the `@app.get` decorator;
+    # they are also the structured source for OpenAPI parameter docs (fastzap#3).
+    app.with_params(
+        "GET",
+        "/items/{id}",
+        [fastzap.path_param_spec("id", fastzap.ParamType.IntT)],
+    )
 
     # Tune the staged drain for a fast-rolling deployment: keep serving 3s into
     # the endpoint-propagation window, then up to 20s of in-flight drain — a 23s
