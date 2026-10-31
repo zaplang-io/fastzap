@@ -1,0 +1,47 @@
+ok openapi status 200
+ok openapi content-type json
+ok openapi version 3.0.3
+ok info title
+ok info version
+ok info description
+ok path root present
+ok path item present
+ok path collection present
+ok path param in
+ok path param name
+ok path param type
+ok path param description
+ok query param in
+ok query param name
+ok query param optional
+ok requestBody present
+ok body media type
+ok body schema object
+ok body schema title
+ok body name minLength
+ok body price number
+ok body price minimum
+ok body required array
+ok body array field
+ok response 201 present
+ok response 201 description
+ok auto 422 present
+ok operationId get item
+ok operationId post item
+ok docs path excluded
+ok openapi path excluded
+ok roundtrips as object
+ok roundtrip has info
+ok roundtrip has paths
+ok openapi is GET-only
+ok docs status 200
+ok docs content-type html
+ok docs references openapi
+ok docs loads swagger bundle
+ok docs loads swagger css
+ok disabled openapi is 404
+ok disabled docs is 404
+ok emitter object type
+ok emitter str minLength
+ok emitter array items
+all tests passed

@@ -167,6 +167,44 @@ of field errors (never just the first):
 - `fastzap.json_response(status, body)` / `fastzap.text_response(status, body)` /
   `fastzap.json_error(status, detail)` — build a response directly.
 
+## Interactive API docs (OpenAPI)
+
+Like FastAPI, fastzap serves a generated **OpenAPI 3** document and an
+interactive docs UI out of the box — no extra wiring:
+
+- **`GET /openapi.json`** — the OpenAPI 3.0.3 document, generated from the live
+  route table: each route's path template, its declared **param specs** (the
+  OpenAPI `parameters:`, see *Strict typed params* above) and its associated
+  request/response **body schemas** (mapped from a `validation.Schema` to JSON
+  Schema).
+- **`GET /docs`** — a [Swagger UI](https://swagger.io/tools/swagger-ui/) page
+  (loaded from a CDN) pointed at `/openapi.json`.
+
+Parameters come from the `with_params` specs automatically. Body schemas are
+associated with a route explicitly — a handler validates its body with
+`req.validate(schema)` *inside* its body, which the framework cannot observe, so
+you declare the association the same way you declare param specs:
+
+```zap
+def main():
+    auto app = fastzap.app()
+    app.with_params("GET", "/items/{id}", [
+        fastzap.path_param_spec("id", fastzap.ParamType.IntT),
+    ])
+    # Request + response body schemas for the OpenAPI document.
+    app.with_body("POST", "/items", item_schema())
+    app.with_response("POST", "/items", 201, item_schema(), "the created item")
+
+    # Customize the info block / paths, or turn the docs off entirely.
+    app.configure_docs(fastzap.docs_config(title="Items API", version="1.0.0"))
+    fastzap.run(app, "0.0.0.0", 8000)
+```
+
+The `validation` → JSON Schema emitter lives in `fastzap.jsonschema` as a
+self-contained, framework-agnostic module (so it can be upstreamed into the
+`validation` package later). Docs are on by default; `docs_config(enabled=False)`
+disables both endpoints. See [DECISIONS.md](DECISIONS.md) (D-FZ-0012).
+
 ## Dependency injection
 
 fastzap supports the idiomatic FastAPI `Depends(...)` form: a handler declares a
