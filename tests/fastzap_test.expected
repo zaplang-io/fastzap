@@ -1,0 +1,29 @@
+ok route root status
+ok route root body
+ok path param status
+ok path param captured
+ok path param content-type
+ok trailing slash normalized
+ok two path params
+ok unknown path is 404
+ok wrong method is 405
+ok query plus-decoded + int
+ok query percent-decoded
+ok query defaults
+ok query_int fallback on garbage
+ok readiness ready is 200
+ok readiness draining is 503
+ok valid body is 201
+ok created content-type json
+ok created echoes name
+ok invalid body is 422
+ok 422 names the failure
+ok 422 reports a field
+ok json_error status
+ok json_error body
+ok wire status line
+ok wire content-type
+ok wire content-length
+ok wire connection close
+ok wire body after blank line
+all tests passed
