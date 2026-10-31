@@ -108,8 +108,10 @@ Unknown paths return `404`; a known path reached with the wrong method returns
 > `Depends` need a reflection-driven adapter the language can't express yet
 > (parameter reflection exists but is descriptive-only and name-keyed, while the
 > dispatch seam holds opaque function values); tracked at
-> [zaplang-io/zap#466](https://github.com/zaplang-io/zap/issues/466). See
-> [DECISIONS.md](DECISIONS.md) (D-FZ-0007, D-FZ-0008).
+> [zaplang-io/zap#466](https://github.com/zaplang-io/zap/issues/466). The
+> [`fastzap.di`](#dependency-injection-prototype) prototype ships the *semantics*
+> of `Depends` as an explicit toolkit in the meantime. See
+> [DECISIONS.md](DECISIONS.md) (D-FZ-0007, D-FZ-0008, D-FZ-0009).
 
 ## Typed models
 
@@ -124,6 +126,47 @@ of field errors (never just the first):
   `{"detail": "validation failed", "errors": [{loc, kind, msg}, ...]}`.
 - `fastzap.json_response(status, body)` / `fastzap.text_response(status, body)` /
   `fastzap.json_error(status, detail)` — build a response directly.
+
+## Dependency injection (prototype)
+
+`fastzap.di` gives FastAPI `Depends` **semantics** — composable, per-request,
+resolve-once dependencies — as an explicit, type-safe toolkit. It is **not** the
+FastAPI signature (`def h(db: DB = Depends(get_db))`): that *injects* into a
+handler's declared params, which needs a language capability that has not shipped
+(see [D-FZ-0008](DECISIONS.md) / [zaplang-io/zap#466](https://github.com/zaplang-io/zap/issues/466)).
+Here injection is explicit in the handler body.
+
+Model your dependency graph as providers that memoize into a per-request context:
+
+```zap
+import fastzap.di
+
+struct Ctx:                                  # one Cell per shared dependency
+    di.Cell[Settings] settings
+    di.Cell[DB] db
+
+def fresh_ctx() -> Ctx:
+    return Ctx(di.new_cell[Settings](), di.new_cell[DB]())
+
+def get_settings(Ctx c) -> Settings:
+    return di.resolve(c.settings, lambda: Settings("prod"))
+
+def get_db(Ctx c) -> DB:                     # composes: db depends on settings
+    return di.resolve(c.db, lambda: DB(get_settings(c).env + "://db"))
+
+@app.get("/me")
+def me(fastzap.Request req) -> fastzap.Response:
+    auto c = fresh_ctx()                     # a fresh scope per request
+    return fastzap.text_response(200, get_db(c).dsn)
+```
+
+`di.resolve(cell, provider)` runs `provider` only the first time and memoizes, so
+a dependency needed by several providers resolves **once** per request; a provider
+**composes** by calling another inside its thunk; the context is fresh per handler
+call, which is **per request**. A closure-free form (`di.cell_has` / `di.cell_put`
+/ `di.cell_value` / `di.cell_or`) is also available. When zap#466 lands, the
+`Depends`-in-the-signature form can layer over these same providers. See
+[DECISIONS.md](DECISIONS.md) (D-FZ-0009).
 
 ## Graceful shutdown (zero dropped requests)
 
@@ -203,11 +246,14 @@ request/response models via `validation`, the built-in coroutine HTTP server,
 per-request structured-concurrency scopes, and the staged graceful shutdown, with
 tests and a runnable example.
 
+**Also in v1:** a dependency-injection prototype (`fastzap.di`, D-FZ-0009) giving
+composable/per-request/resolve-once `Depends` semantics as an explicit toolkit.
+
 **Deferred follow-ups** (tracked against the #312 epic #432): OpenAPI/Swagger
-generation, dependency injection + typed per-parameter injection (`Depends`;
-blocked on [zaplang-io/zap#466](https://github.com/zaplang-io/zap/issues/466), see
-D-FZ-0008), middleware/filters, HTTPS/TLS termination, and keep-alive / streaming
-bodies. See [DECISIONS.md](DECISIONS.md).
+generation, the FastAPI `Depends`-in-the-signature form + typed per-parameter
+injection (blocked on [zaplang-io/zap#466](https://github.com/zaplang-io/zap/issues/466),
+see D-FZ-0008), middleware/filters, HTTPS/TLS termination, and keep-alive /
+streaming bodies. See [DECISIONS.md](DECISIONS.md).
 
 ## License
 

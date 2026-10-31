@@ -21,6 +21,9 @@ src/fastzap/wire.zap   a self-contained HTTP/1.1 wire + URL helper: request-targ
                        list/dict, never a fastzap type, so it never imports back
                        into fastzap and the import graph stays acyclic (Zap v1
                        rejects cycles).
+src/fastzap/di.zap     a prototype dependency-injection toolkit (D-FZ-0009): a
+                       generic per-request memo Cell[T] + resolve(). Also a LEAF
+                       (generics + Optional only, no fastzap type).
 vendor/validation/     a vendored copy of the `validation` package (see below).
 ```
 
@@ -142,6 +145,10 @@ while authoring — every `.zap` here was checked with a front-end-only `zap`
   asserts the route table was populated and dispatches identically to the engine
   that `fastzap_test.zap` drives by hand — proving the decorator is pure sugar
   over the same registration.
+- `tests/di_test.zap` — the dependency-injection prototype (D-FZ-0009): a
+  composed provider graph (settings ← db ← principal) resolved over the real
+  `@app.get` dispatch path, asserting composition, per-request-fresh scope, and
+  shared single-resolution (a build counter proves the DB provider runs once).
 - `tests/shutdown_test.zap` — the staged drain over the **real signal path**:
   `signal.notify(SIGTERM)` + `__raise_signal(15)` + `__signal_drain()` deliver
   the signal deterministically (exactly as the compiler's own signal goldens do),
