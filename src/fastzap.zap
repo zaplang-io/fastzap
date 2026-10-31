@@ -51,14 +51,22 @@
 # (`App.get/post/...` below) is the seam the decorator lowers to and remains
 # available for programmatic registration.
 #
-# The handler is a single uniform signature `fn(Request) -> Response`; typed
-# values are pulled off the Request (`path_param_int`, `query_int`, `validate`).
-# FastAPI-style per-parameter injection (`id: int`, `q: str = ...`) and
-# `Depends(...)` dependency injection are NOT offered: they need a reflection-
-# driven adapter that binds a handler's declared params per request, which the
-# current language primitives cannot express (zaplang-io/zap#458/D-0089 reflection
-# is descriptive-only and name-keyed, and the dispatch seam holds opaque fn
-# values). Tracked as a language gap; see DECISIONS.md (D-FZ-0007, D-FZ-0008).
+# DEPENDENCY INJECTION — FastAPI-style `Depends(...)` (fastzap#7, D-FZ-0010):
+# A handler declares a dependency as a parameter with a `Depends(provider)`
+# default — `def me(Request req, DB db = Depends(get_db)) -> Response` — and the
+# `@app.get` desugar synthesizes a per-handler adapter that resolves each provider
+# (its own `Depends(...)` parameters first, once per request) and injects the
+# results, then registers the adapter on the uniform seam (zaplang-io/zap#466,
+# D-0092). `Depends` is a compiler-recognized marker, not a library value, so it
+# is written bare (no import). Providers are plain `def provider(...) -> T` whose
+# own dependencies are themselves `Depends(...)` parameters.
+#
+# SCOPE BOUNDARY (v1): the adapter injects `Depends` and passes the Request
+# through positionally only. Path/query/body stay framework-side — handlers and
+# providers read typed values off the Request (`path_param_int`, `query_int`,
+# `validate`). A provider parameter that is NOT itself `Depends(...)` is
+# request-derived and rejected (ZAP5048). A future `@query`/`@path` source
+# annotation is a separate capability. See DECISIONS.md (D-FZ-0007, D-FZ-0010).
 #
 # NOTE: Zap's `and`/`or` do not short-circuit today (both operands are always
 # evaluated, zaplang-io/zap), so this module never guards an index/lookup with a

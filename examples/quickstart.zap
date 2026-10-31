@@ -6,6 +6,7 @@
 #   curl localhost:8000/                       # service banner
 #   curl localhost:8000/items/42               # a path parameter
 #   curl 'localhost:8000/items?limit=5'        # a query parameter
+#   curl localhost:8000/db                     # a Depends(...) injected dependency
 #   curl -XPOST localhost:8000/items -d '{"name":"Book","price":9.5}'   # 201
 #   curl -XPOST localhost:8000/items -d '{"name":"","price":-1}'        # 422
 #   curl localhost:8000/healthz                # readiness (200, 503 while draining)
@@ -49,6 +50,28 @@ def read_item(fastzap.Request req) -> fastzap.Response:
     o["id"] = JsonValue.Int(id)
     o["name"] = JsonValue.Str("item-" + str(id))
     return fastzap.json_response(200, json.dumps(JsonValue.Object(o)))
+
+# FastAPI-style dependency injection (fastzap#7, DECISIONS.md D-FZ-0010): `db` is
+# declared as a handler parameter with a `Depends(get_db)` default, and the
+# compiler injects it. `get_db`'s own `Settings` dependency is itself a
+# `Depends(...)` parameter, resolved first (deps-first) and once per request.
+# `Depends` is a bare compiler marker — no import. See the README "Dependency
+# injection" section.
+struct Settings:
+    str env
+
+struct DB:
+    str dsn
+
+def get_settings() -> Settings:
+    return Settings("prod")
+
+def get_db(Settings s = Depends(get_settings)) -> DB:
+    return DB(s.env + "://db")
+
+@app.get("/db")
+def show_db(fastzap.Request req, DB db = Depends(get_db)) -> fastzap.Response:
+    return fastzap.json_response(200, "{\"dsn\":\"" + db.dsn + "\"}")
 
 # A typed POST handler: validate the body into a model, or return 422 with the
 # full list of field errors (this is pydantic's role, played by `validation`).
