@@ -105,7 +105,7 @@ def main():
     check("query plus-decoded + int", r_q.body == "q=hi there;n=3")
 
     auto r_pct = fastzap.dispatch(app, fastzap.request("GET", "/search?q=a%20b%21", ""))
-    check("query percent-decoded", r_pct.body == "q=a b!")
+    check("query percent-decoded", r_pct.body == "q=a b!;n=0")
 
     auto r_def = fastzap.dispatch(app, fastzap.request("GET", "/search", ""))
     check("query defaults", r_def.body == "q=;n=0")
