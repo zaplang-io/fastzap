@@ -139,13 +139,32 @@ def request(str method, str target, str body) -> Request:
     auto query = wire.parse_query(wire.target_query(target))
     return Request(method, path, target, body, query, pp, hdrs)
 
+# Parse an int, or return `fallback` when `s` is not a well-formed integer.
+# `int()` aborts (an uncatchable fault, not a catchable exception) on bad input,
+# so the string is validated BEFORE calling it rather than catching a failure.
 def _to_int(str s, int64 fallback) -> int64:
-    if len(s) == 0:
-        return fallback
-    try:
+    if _is_int_str(s):
         return int(s)
-    except:
-        return fallback
+    return fallback
+
+# True when `s` is a non-empty optionally-signed run of ASCII digits.
+def _is_int_str(str s) -> bool:
+    if len(s) == 0:
+        return False
+    auto start = 0
+    if s[0:1] == "-":
+        if len(s) == 1:
+            return False
+        start = 1
+    auto j = start
+    while j < len(s):
+        auto c = s[j:j + 1]
+        if c < "0":
+            return False
+        if c > "9":
+            return False
+        j = j + 1
+    return True
 
 # --- response builders -----------------------------------------------------
 
