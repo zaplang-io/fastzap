@@ -367,12 +367,91 @@ carrying exactly the OpenAPI Parameter Object fields (`name`, `in` = path/query,
 item's `parameters:` by walking `route.params` — no second declaration, and the
 `description` slot is already present for doc text.
 
+## D-FZ-0012 — OpenAPI 3 generation + interactive docs
+
+**Decision.** Serve a generated **OpenAPI 3.0.3** document at **`GET
+/openapi.json`** and an interactive **Swagger UI** page at **`GET /docs`**, both
+on by default (FastAPI parity). The document is built on demand from the live
+`App`: path templates (already in OpenAPI `{param}` form), each route's declared
+param specs ([D-FZ-0011](#d-fz-0011--strict-typed-param-coercion--explicit-param-specs)
+— the `parameters:` source), and its associated request/response **body
+schemas** mapped to JSON Schema. This is the headline FastAPI feature the #312
+epic deferred.
+
+**Served by `dispatch`, not a handler.** A route handler is `fn(Request) ->
+Response` and has no handle on the `App`, so it cannot walk the route table to
+emit the document. The two endpoints are therefore served by `dispatch` directly
+off the live `App` — exactly as the readiness endpoint already is — gated on
+`DocsConfig.enabled` and GET-only (other methods fall through to the normal
+404/405 path). `configure_docs(docs_config(...))` sets the `info` block
+(title/version/description), relocates either path, or disables both.
+
+**Body-schema association — explicit `with_body` / `with_response`.** Param specs
+supply `parameters:`; a route's request/response **body** schemas are the other
+half. A handler validates a body by calling `req.validate(schema)` *inside* its
+body — a runtime call the framework cannot observe statically — so the
+body↔route association is **declared explicitly**, keyed by method + path, the
+same shape as `with_params`:
+
+```zap
+app.with_body("POST", "/items", request_body_spec(item_schema()))      # requestBody
+app.with_response("POST", "/items", response_spec(201, item_schema()))  # responses[201]
+```
+
+The spec builders `request_body_spec(schema, required=.., description=..)` and
+`response_spec(status, schema, description=..)` are **free functions** (where
+default/keyword args work — zaplang-io/zap#298); the `with_body`/`with_response`
+methods take a pre-built spec, because a method takes positional-only args in Zap
+v1, exactly as `with_params` takes pre-built `ParamSpec`s.
+
+This keeps the surface honest: it documents what the handler actually does and
+relies on **no** reflection capability that does not exist. The specs ride on the
+`Route` (lists of 0-or-1 / 0-or-more, mirroring how `validation` sidesteps
+Optional) and are read **only** by the generator — they never affect dispatch.
+Rejected: inferring the body schema from the handler (needs value reflection the
+language does not have — the open half of
+[D-FZ-0008](#d-fz-0008--dependency-injection-stays-deferred)); a new registration
+verb carrying schemas (the `@app.*` decorator desugars to `app.get(path,
+handler)` only, so, as with param specs, schemas cannot ride the decorator — a
+post-registration attach composes with both decorated and programmatic routes).
+
+**JSON Schema emitter — a separable leaf module.** The `validation.Schema` →
+JSON Schema mapping lives in `src/fastzap/jsonschema.zap`, importing **only**
+`validation` (so the import graph stays acyclic — the OpenAPI walk, which needs
+the `App`/`Route` types, stays in `fastzap.zap`). It is deliberately
+framework-agnostic (nothing about routes/HTTP), so it can be lifted into the
+`validation` package itself later; fastzap owns it for now. It maps each
+`FieldType` to the OpenAPI-3.0 JSON Schema subset (`type`, `properties`,
+`required`, `minimum`/`maximum`, `minLength`/`maxLength`, `pattern`, `items`,
+`minItems`/`maxItems`, `additionalProperties`), omitting a constraint whose bound
+is `validation`'s open sentinel, and treating a required-with-default field as
+not required of the caller (matching the engine's own rule).
+
+**Document shape.** `openapi`/`info`/`paths`; each operation carries an
+`operationId`, `parameters` (from specs), a `requestBody` (from a body spec), and
+`responses`. A validating route (params or a request body) gains a `422
+Validation Error` response automatically unless one is declared; a route with no
+declared responses still gets a default `200` (OpenAPI requires a non-empty
+responses map). The readiness/docs/openapi endpoints are excluded from the
+document. Key order in the emitted JSON is unspecified (`dict` iteration order),
+so nothing — tests included — relies on it.
+
+**Relationship to fastzap#2 (middleware).** Independent. Middleware
+([D-FZ](#deferred-to-follow-up-issues-against-the-312-epic-432) deferred list)
+could later wrap or serve the docs routes, but #3 is not blocked on it — the
+docs are served inline by `dispatch` today.
+
+**`/docs` asset handling.** The page is a ~500-byte HTML shell that loads Swagger
+UI (CSS + bundle) from jsDelivr at a pinned version; no bundle is vendored. Redoc
+would be a drop-in alternative; Swagger UI chosen for FastAPI familiarity.
+
 ## Deferred to follow-up issues (against the #312 epic #432)
 
 Not blocking a coherent v1; noted so they are not forgotten:
 
-- **OpenAPI/Swagger generation** — needs schema introspection over the
-  `validation` schemas + a route-table walk.
+- **OpenAPI/Swagger generation** — **shipped**; `/openapi.json` + `/docs`
+  generated from the route table, param specs and associated body schemas, see
+  [D-FZ-0012](#d-fz-0012--openapi-3-generation--interactive-docs).
 - **Dependency injection** — the FastAPI `Depends(...)` form **ships**
   ([D-FZ-0010](#d-fz-0010--dependency-injection-the-real-depends-form)), now that
   zaplang-io/zap#466 (D-0092) landed; it supersedes the `di.zap` prototype

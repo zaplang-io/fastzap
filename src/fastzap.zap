@@ -85,6 +85,7 @@
 # boolean operator; such checks are written as nested `if`s.
 
 import fastzap.wire
+import fastzap.jsonschema
 import validation
 
 # ---------------------------------------------------------------------------
@@ -250,6 +251,10 @@ def json_response(int64 status, str body) -> Response:
 # A plain-text response.
 def text_response(int64 status, str body) -> Response:
     return Response(status, "text/plain; charset=utf-8", body)
+
+# An HTML response (used to serve the interactive `/docs` page, fastzap#3).
+def html_response(int64 status, str body) -> Response:
+    return Response(status, "text/html; charset=utf-8", body)
 
 # 200 with a validated model serialized back to JSON.
 def ok_model(validation.Model m) -> Response:
@@ -448,6 +453,49 @@ def _perr(list[validation.ValErr] errs, str loc, str kind, str msg):
     errs.append(validation.ValErr(loc=loc, kind=kind, msg=msg))
 
 # ---------------------------------------------------------------------------
+# Body-schema association (fastzap#3, D-FZ-0012)
+# ---------------------------------------------------------------------------
+#
+# Param specs (above) supply OpenAPI's `parameters:`; a route's request- and
+# response-BODY schemas are the other half. A handler validates a body against a
+# `validation.Schema` by calling `req.validate(schema)` INSIDE its body — a
+# runtime call the framework cannot observe statically, so the body/route
+# association is DECLARED explicitly, exactly as param specs are: a route-level
+# attach keyed by method + path (`App.with_body` / `App.with_response`). This
+# stays honest — it documents what the handler actually does, and relies on no
+# reflection capability that does not exist. The specs are carried on the `Route`
+# and read only by the OpenAPI generator; they do not affect dispatch.
+
+# A request body associated with a route: the schema its JSON body is validated
+# against, whether a body is required, and a description slot for OpenAPI.
+struct RequestBodySpec:
+    validation.Schema schema
+    bool required
+    str description
+
+# A response body associated with a route at a given status code.
+struct ResponseSpec:
+    int64 status
+    validation.Schema schema
+    str description
+
+# Declare the request body schema for a route (OpenAPI `requestBody`).
+def request_body_spec(
+    validation.Schema schema,
+    bool required = True,
+    str description = "",
+) -> RequestBodySpec:
+    return RequestBodySpec(schema, required, description)
+
+# Declare a response body schema for a route at `status` (OpenAPI `responses`).
+def response_spec(
+    int64 status,
+    validation.Schema schema,
+    str description = "",
+) -> ResponseSpec:
+    return ResponseSpec(status, schema, description)
+
+# ---------------------------------------------------------------------------
 # Routing
 # ---------------------------------------------------------------------------
 
@@ -460,6 +508,13 @@ struct Route:
     list[str] segs
     fn(Request) -> Response handler
     list[ParamSpec] params
+    # Body-schema associations for OpenAPI (fastzap#3). Each is a list of 0-or-1
+    # (a request body) / 0-or-more (responses by status) — a list, not an
+    # Optional, mirroring how `validation` sidesteps Optional. Empty unless
+    # attached via `App.with_body` / `App.with_response`. Read only by the
+    # OpenAPI generator; they never affect dispatch.
+    list[RequestBodySpec] request_bodies
+    list[ResponseSpec] responses
 
 # The result of resolving a request against the route table. `idx` is the
 # matching route or -1; `path_exists` distinguishes 404 (no path match) from 405
@@ -546,6 +601,39 @@ def default_shutdown() -> ShutdownConfig:
     return ShutdownConfig(2000, 25000, "/healthz")
 
 # ---------------------------------------------------------------------------
+# OpenAPI / interactive-docs configuration (fastzap#3, D-FZ-0012)
+# ---------------------------------------------------------------------------
+
+# Where the generated OpenAPI document and the interactive docs UI are served,
+# plus the `info` block (title/version/description) stamped into the document.
+# `enabled` gates both endpoints. Served by `dispatch` directly off the live
+# `App` (like the readiness endpoint), because a handler is `fn(Request) ->
+# Response` and has no handle on the `App` to walk its route table.
+struct DocsConfig:
+    bool enabled
+    str openapi_path
+    str docs_path
+    str title
+    str version
+    str description
+
+# Defaults: docs ON (FastAPI parity) at `/openapi.json` + `/docs`, titled
+# "fastzap" at version "0.1.0". Override with `app.configure_docs(...)`.
+def default_docs() -> DocsConfig:
+    return DocsConfig(True, "/openapi.json", "/docs", "fastzap", "0.1.0", "")
+
+# Build a docs configuration (keyword args let a caller set only what it needs).
+def docs_config(
+    bool enabled = True,
+    str title = "fastzap",
+    str version = "0.1.0",
+    str description = "",
+    str openapi_path = "/openapi.json",
+    str docs_path = "/docs",
+) -> DocsConfig:
+    return DocsConfig(enabled, openapi_path, docs_path, title, version, description)
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
@@ -553,11 +641,24 @@ struct App:
     list[Route] routes
     ServerState state
     ShutdownConfig shutdown
+    DocsConfig docs
 
     # Register a handler for an arbitrary method + path template.
     def route(self, str method, str path, fn(Request) -> Response h):
         list[ParamSpec] no_specs = []
-        self.routes.append(Route(method, path, wire.path_segments(path), h, no_specs))
+        list[RequestBodySpec] no_body = []
+        list[ResponseSpec] no_resp = []
+        self.routes.append(
+            Route(
+                method,
+                path,
+                wire.path_segments(path),
+                h,
+                no_specs,
+                no_body,
+                no_resp,
+            ),
+        )
 
     # Attach a strict param-spec surface to an already-registered route (matched
     # by method + path template). Declarative and decoupled from registration, so
@@ -595,11 +696,50 @@ struct App:
     def configure_shutdown(self, ShutdownConfig cfg):
         self.shutdown = cfg
 
-# Construct a new application with default shutdown settings.
+    # Replace the OpenAPI / interactive-docs configuration (fastzap#3).
+    def configure_docs(self, DocsConfig cfg):
+        self.docs = cfg
+
+    # Associate a request-body spec with an already-registered route (matched by
+    # method + path template). Declarative and decoupled from registration,
+    # exactly like `with_params`, so it composes with BOTH the `@app.post`
+    # decorator and programmatic `app.<verb>` calls. Read only by the OpenAPI
+    # generator (fastzap#3); it does NOT change how `dispatch` runs the handler —
+    # a handler still validates the body itself via `req.validate(schema)`. A
+    # method/path with no matching route is a no-op. The spec is built with the
+    # free function `request_body_spec(schema, required=.., description=..)` —
+    # defaults live there, not here, because a method takes positional-only args
+    # in Zap v1 (zaplang-io/zap#298), exactly as `with_params` takes pre-built
+    # `ParamSpec`s.
+    def with_body(self, str method, str path, RequestBodySpec spec):
+        auto i = 0
+        while i < len(self.routes):
+            auto r = self.routes[i]
+            if r.method == method:
+                if r.path == path:
+                    list[RequestBodySpec] bs = [spec]
+                    r.request_bodies = bs
+            i = i + 1
+
+    # Associate a response-body spec with an already-registered route. Appends,
+    # so several status codes can be declared for one route. Read only by the
+    # OpenAPI generator (fastzap#3). A method/path with no matching route is a
+    # no-op. Build the spec with the free function `response_spec(status, schema,
+    # description=..)` (see the note on `with_body` re: positional-only methods).
+    def with_response(self, str method, str path, ResponseSpec spec):
+        auto i = 0
+        while i < len(self.routes):
+            auto r = self.routes[i]
+            if r.method == method:
+                if r.path == path:
+                    r.responses.append(spec)
+            i = i + 1
+
+# Construct a new application with default shutdown + docs settings.
 def app() -> App:
     list[Route] rs = []
     auto st = ServerState(True, False, Stage.Running, 0)
-    return App(rs, st, default_shutdown())
+    return App(rs, st, default_shutdown(), default_docs())
 
 # Resolve a request to a response: the readiness endpoint first, then the route
 # table (404 vs 405 distinguished), then the handler. Never raises.
@@ -608,6 +748,16 @@ def dispatch(App app, Request req) -> Response:
         if app.state.ready:
             return json_response(200, "{\"status\":\"ready\"}")
         return json_response(503, "{\"status\":\"draining\"}")
+    # OpenAPI document + interactive docs UI (fastzap#3). Served here off the live
+    # `App` — a handler is `fn(Request) -> Response` with no handle on the route
+    # table — exactly as the readiness endpoint is. GET-only; other methods fall
+    # through to the normal 404/405 path.
+    if app.docs.enabled:
+        if req.method == "GET":
+            if req.path == app.docs.openapi_path:
+                return json_response(200, openapi_json(app))
+            if req.path == app.docs.docs_path:
+                return html_response(200, docs_html(app))
     auto segs = wire.path_segments(req.path)
     auto m = _match(app, req.method, segs)
     if m.idx < 0:
@@ -629,6 +779,231 @@ def dispatch(App app, Request req) -> Response:
         req.params = coerced
     fn(Request) -> Response h = route.handler
     return h(req)
+
+# ---------------------------------------------------------------------------
+# OpenAPI 3 generation + interactive docs (fastzap#3, D-FZ-0012)
+# ---------------------------------------------------------------------------
+#
+# The generated document is assembled from the live route table: the path
+# templates (already in OpenAPI `{param}` form), each route's declared param
+# specs (fastzap#4 — the `parameters:` source) and its declared body/response
+# schemas (D-FZ-0012 — mapped to JSON Schema by `fastzap.jsonschema`). Built
+# on demand from the `App` each time `/openapi.json` is served (docs are not a
+# hot path); nothing is cached. `JsonValue` object key order is unspecified, so
+# the generator never relies on it — tests assert on contiguous `"key":value`
+# tokens, not a byte-exact document.
+
+# The OpenAPI document as a `JsonValue` (serialize with `openapi_json`).
+def openapi_doc(App app) -> JsonValue:
+    dict[str, JsonValue] paths = {}
+    auto i = 0
+    while i < len(app.routes):
+        auto r = app.routes[i]
+        if _route_documented(app, r):
+            dict[str, JsonValue] item = {}
+            if r.path in paths:
+                match paths[r.path]:
+                    case JsonValue.Object(existing):
+                        item = existing
+                    case _:
+                        item = {}
+            item[r.method.lower()] = _operation_object(r)
+            paths[r.path] = JsonValue.Object(item)
+        i = i + 1
+    dict[str, JsonValue] info = {}
+    info["title"] = JsonValue.Str(app.docs.title)
+    info["version"] = JsonValue.Str(app.docs.version)
+    if app.docs.description != "":
+        info["description"] = JsonValue.Str(app.docs.description)
+    dict[str, JsonValue] doc = {}
+    doc["openapi"] = JsonValue.Str("3.0.3")
+    doc["info"] = JsonValue.Object(info)
+    doc["paths"] = JsonValue.Object(paths)
+    return JsonValue.Object(doc)
+
+# The OpenAPI document as a compact JSON string (served at `/openapi.json`).
+def openapi_json(App app) -> str:
+    return json.dumps(openapi_doc(app))
+
+# Whether a route appears in the document. The readiness and docs endpoints are
+# framework plumbing, not part of the described API, so they are excluded (they
+# are not real routes anyway — `dispatch` serves them directly — but a user route
+# registered at the same path is skipped too, matching FastAPI hiding its docs).
+def _route_documented(App app, Route r) -> bool:
+    if r.path == app.shutdown.readiness_path:
+        return False
+    if r.path == app.docs.openapi_path:
+        return False
+    if r.path == app.docs.docs_path:
+        return False
+    return True
+
+# The OpenAPI Operation Object for one route: an operationId, its `parameters`
+# (from param specs), its `requestBody` (from a body spec, if any) and its
+# `responses`.
+def _operation_object(Route r) -> JsonValue:
+    dict[str, JsonValue] op = {}
+    op["operationId"] = JsonValue.Str(_operation_id(r))
+    if len(r.params) > 0:
+        list[JsonValue] ps = []
+        for sp in r.params:
+            ps.append(_parameter_object(sp))
+        op["parameters"] = JsonValue.Array(ps)
+    if len(r.request_bodies) > 0:
+        op["requestBody"] = _request_body_object(r.request_bodies[0])
+    op["responses"] = _responses_object(r)
+    return JsonValue.Object(op)
+
+# A stable operationId: the lowercased method followed by the path with each
+# non-alphanumeric run turned into a single "_" ("GET" + "/items/{id}" ->
+# "get_items_id").
+def _operation_id(Route r) -> str:
+    auto out = r.method.lower()
+    auto prev_us = False
+    auto i = 0
+    auto n = len(r.path)
+    while i < n:
+        auto c = r.path[i:i + 1]
+        if _is_ident_char(c):
+            out = out + c
+            prev_us = False
+        else:
+            if prev_us == False:
+                out = out + "_"
+                prev_us = True
+        i = i + 1
+    return out
+
+def _is_ident_char(str c) -> bool:
+    if c >= "0":
+        if c <= "9":
+            return True
+    if c >= "a":
+        if c <= "z":
+            return True
+    if c >= "A":
+        if c <= "Z":
+            return True
+    return False
+
+# The OpenAPI Parameter Object for one declared param spec. The spec's fields map
+# 1:1 (name, in=path/query, required, schema type, default, description).
+def _parameter_object(ParamSpec sp) -> JsonValue:
+    dict[str, JsonValue] schema = {}
+    schema["type"] = _ptype_json_type(sp.ptype)
+    if sp.has_default:
+        schema["default"] = _param_default_json(sp)
+    dict[str, JsonValue] o = {}
+    o["name"] = JsonValue.Str(sp.name)
+    o["in"] = _loc_json_in(sp.loc)
+    o["required"] = JsonValue.Bool(sp.required)
+    o["schema"] = JsonValue.Object(schema)
+    if sp.description != "":
+        o["description"] = JsonValue.Str(sp.description)
+    return JsonValue.Object(o)
+
+def _ptype_json_type(ParamType t) -> JsonValue:
+    match t:
+        case ParamType.IntT:
+            return JsonValue.Str("integer")
+        case ParamType.StrT:
+            return JsonValue.Str("string")
+        case ParamType.BoolT:
+            return JsonValue.Str("boolean")
+
+def _loc_json_in(ParamLoc loc) -> JsonValue:
+    match loc:
+        case ParamLoc.Path:
+            return JsonValue.Str("path")
+        case ParamLoc.Query:
+            return JsonValue.Str("query")
+
+# A param's declared default, rendered as the JSON type matching its ParamType
+# (the default is stored as a string; an int/bool default is parsed to its typed
+# JSON value, a str default passes through).
+def _param_default_json(ParamSpec sp) -> JsonValue:
+    match sp.ptype:
+        case ParamType.IntT:
+            if _is_int_str(sp.default):
+                return JsonValue.Int(int(sp.default))
+            return JsonValue.Str(sp.default)
+        case ParamType.BoolT:
+            auto code = _bool_code(sp.default)
+            if code == 1:
+                return JsonValue.Bool(True)
+            if code == 0:
+                return JsonValue.Bool(False)
+            return JsonValue.Str(sp.default)
+        case ParamType.StrT:
+            return JsonValue.Str(sp.default)
+
+# The OpenAPI Request Body Object: the declared schema as a JSON Schema under
+# `application/json`.
+def _request_body_object(RequestBodySpec b) -> JsonValue:
+    dict[str, JsonValue] media = {}
+    media["schema"] = jsonschema.of_schema(b.schema)
+    dict[str, JsonValue] content = {}
+    content["application/json"] = JsonValue.Object(media)
+    dict[str, JsonValue] o = {}
+    o["required"] = JsonValue.Bool(b.required)
+    o["content"] = JsonValue.Object(content)
+    if b.description != "":
+        o["description"] = JsonValue.Str(b.description)
+    return JsonValue.Object(o)
+
+# The OpenAPI Responses Object. Declared response specs become status entries
+# with a JSON-Schema body; a route with no declared responses still gets a
+# default 200 (OpenAPI requires a non-empty responses map), and a route that
+# validates input (params or a request body) gains a 422 Validation Error entry
+# unless one was declared explicitly.
+def _responses_object(Route r) -> JsonValue:
+    dict[str, JsonValue] resp = {}
+    for rs in r.responses:
+        dict[str, JsonValue] media = {}
+        media["schema"] = jsonschema.of_schema(rs.schema)
+        dict[str, JsonValue] content = {}
+        content["application/json"] = JsonValue.Object(media)
+        dict[str, JsonValue] one = {}
+        auto desc = rs.description
+        if desc == "":
+            desc = "Successful Response"
+        one["description"] = JsonValue.Str(desc)
+        one["content"] = JsonValue.Object(content)
+        resp[str(rs.status)] = JsonValue.Object(one)
+    if len(r.responses) == 0:
+        dict[str, JsonValue] ok = {}
+        ok["description"] = JsonValue.Str("Successful Response")
+        resp["200"] = JsonValue.Object(ok)
+    auto needs_422 = False
+    if len(r.params) > 0:
+        needs_422 = True
+    if len(r.request_bodies) > 0:
+        needs_422 = True
+    if needs_422:
+        auto has_422 = "422" in resp
+        if has_422 == False:
+            dict[str, JsonValue] ve = {}
+            ve["description"] = JsonValue.Str("Validation Error")
+            resp["422"] = JsonValue.Object(ve)
+    return JsonValue.Object(resp)
+
+# The interactive docs page: a minimal HTML shell that loads Swagger UI from a
+# CDN (pinned) and points it at the OpenAPI endpoint. No bundle is vendored —
+# the page is a few hundred bytes and the assets are fetched by the browser.
+def docs_html(App app) -> str:
+    auto url = app.docs.openapi_path
+    auto title = app.docs.title + " — API docs"
+    auto css = "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/swagger-ui.css"
+    auto js = "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"
+    auto head = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n"
+    auto meta = "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+    auto titletag = "<title>" + title + "</title>\n"
+    auto link = "<link rel=\"stylesheet\" href=\"" + css + "\">\n"
+    auto body_open = "</head>\n<body>\n<div id=\"swagger-ui\"></div>\n"
+    auto script = "<script src=\"" + js + "\"></script>\n"
+    auto init = "<script>\nwindow.ui = SwaggerUIBundle({url: \"" + url + "\", dom_id: \"#swagger-ui\"});\n</script>\n"
+    auto tail = "</body>\n</html>\n"
+    return head + meta + titletag + link + body_open + script + init + tail
 
 # ---------------------------------------------------------------------------
 # Server (coroutine accept loop + staged graceful shutdown)

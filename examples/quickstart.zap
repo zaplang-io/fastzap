@@ -10,6 +10,8 @@
 #   curl localhost:8000/db                     # a Depends(...) injected dependency
 #   curl -XPOST localhost:8000/items -d '{"name":"Book","price":9.5}'   # 201
 #   curl -XPOST localhost:8000/items -d '{"name":"","price":-1}'        # 422
+#   curl localhost:8000/openapi.json           # the generated OpenAPI 3 document
+#   open  localhost:8000/docs                  # interactive Swagger UI
 #   curl localhost:8000/healthz                # readiness (200, 503 while draining)
 #
 # Send SIGTERM (or Ctrl-C) and the server performs the staged drain: readiness
@@ -104,6 +106,19 @@ def main():
         "/items/{id}",
         [fastzap.path_param_spec("id", fastzap.ParamType.IntT)],
     )
+
+    # OpenAPI 3 docs (fastzap#3, D-FZ-0012): fastzap serves a generated document
+    # at /openapi.json and a Swagger UI at /docs (on by default). Params come from
+    # the specs above; associate the POST body + response schemas explicitly so
+    # they appear in the document (a handler validates its body internally, which
+    # the framework cannot observe). `configure_docs` sets the info block.
+    app.with_body("POST", "/items", fastzap.request_body_spec(item_schema()))
+    app.with_response(
+        "POST",
+        "/items",
+        fastzap.response_spec(201, item_schema(), "the created item"),
+    )
+    app.configure_docs(fastzap.docs_config(title="items", version="0.1.0"))
 
     # Tune the staged drain for a fast-rolling deployment: keep serving 3s into
     # the endpoint-propagation window, then up to 20s of in-flight drain — a 23s
