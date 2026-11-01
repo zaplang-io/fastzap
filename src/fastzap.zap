@@ -195,6 +195,32 @@ struct Request:
     def has_param(self, str name) -> bool:
         return name in self.params
 
+# The sink a streaming handler writes its body into, one chunk at a time
+# (fastzap#6, D-FZ-0014). The server hands the producer a `StreamWriter` whose
+# `emit` closure frames each chunk with `Transfer-Encoding: chunked` and sends it
+# on the connection; a test hands one whose `emit` collects chunks into a list, so
+# the incremental producer is exercised with no socket. `emit` returns the byte
+# count it accepted (advisory). Build via `streaming_response` / the server;
+# construct one directly only to drive a producer in a test.
+struct StreamWriter:
+    fn(str) -> int64 emit
+
+    # Write one body chunk. An EMPTY chunk is dropped, never emitted: a
+    # zero-length chunk is the chunked-encoding terminator, so emitting one early
+    # would end the body prematurely. The fn value is read into a typed local
+    # before the call (a fn read out of a field otherwise loses its signature —
+    # the D-0067/D-0091 idiom).
+    def write(self, str chunk):
+        if len(chunk) > 0:
+            fn(str) -> int64 e = self.emit
+            auto _n = e(chunk)
+
+# The default producer for a buffered response: never called (the server pumps a
+# producer only when `streaming` is set), it just gives the `produce` field a
+# value so every `Response` has the same shape.
+def _no_body(StreamWriter w) -> int64:
+    return 0
+
 # A response: an HTTP status, a content type, a body, and any extra headers. Build
 # one with the helpers below (`json_response`, `ok_model`, ...) rather than by
 # hand. `headers` is empty for a plain builder — the wire layer always emits
@@ -202,11 +228,19 @@ struct Request:
 # layers on (e.g. `X-Request-Id`, `Access-Control-Allow-Origin`). Set them
 # functionally with `with_header` (a middleware treats a Response as immutable and
 # returns a new value). See D-FZ-0013.
+#
+# A STREAMING response (fastzap#6, D-FZ-0014) sets `streaming = True` and carries a
+# `produce` closure the server pumps as `Transfer-Encoding: chunked` output; its
+# `body` is empty (the bytes come from the producer). A buffered response has
+# `streaming = False` and `produce = _no_body`. Streaming is a Response SHAPE, so
+# the uniform `fn(Request) -> Response` handler contract (D-FZ-0001) is unchanged.
 struct Response:
     int64 status
     str content_type
     str body
     dict[str, str] headers
+    bool streaming
+    fn(StreamWriter) -> int64 produce
 
 # Build a hand-rolled request (useful for tests and manual dispatch): parses the
 # target into its path + query. Headers are empty.
@@ -249,31 +283,53 @@ def _is_int_str(str s) -> bool:
 
 def response(int64 status, str content_type, str body) -> Response:
     dict[str, str] h = {}
-    return Response(status, content_type, body, h)
+    return Response(status, content_type, body, h, False, _no_body)
 
 # A JSON response from an already-serialized body string.
 def json_response(int64 status, str body) -> Response:
     dict[str, str] h = {}
-    return Response(status, "application/json", body, h)
+    return Response(status, "application/json", body, h, False, _no_body)
 
 # A plain-text response.
 def text_response(int64 status, str body) -> Response:
     dict[str, str] h = {}
-    return Response(status, "text/plain; charset=utf-8", body, h)
+    return Response(status, "text/plain; charset=utf-8", body, h, False, _no_body)
 
 # An HTML response (used to serve the interactive `/docs` page, fastzap#3).
 def html_response(int64 status, str body) -> Response:
     dict[str, str] h = {}
-    return Response(status, "text/html; charset=utf-8", body, h)
+    return Response(status, "text/html; charset=utf-8", body, h, False, _no_body)
+
+# A STREAMING response (fastzap#6, D-FZ-0014): the body is produced incrementally
+# by `produce`, which the server pumps as `Transfer-Encoding: chunked` output —
+# `produce` receives a `StreamWriter` and calls `w.write(chunk)` per chunk. Use it
+# for large or incrementally-computed bodies that should not be buffered whole.
+# `produce` is a plain fn value: a top-level `def produce(StreamWriter w) ->
+# int64` for a fixed body, or a capturing `lambda w: ...` to stream per-request
+# data (the handler closes over what it read off the Request). The handler
+# contract stays `fn(Request) -> Response`.
+def streaming_response(
+    int64 status,
+    str content_type,
+    fn(StreamWriter) -> int64 produce,
+) -> Response:
+    dict[str, str] h = {}
+    return Response(status, content_type, "", h, True, produce)
+
+# A streaming plain-text response (chunked `text/plain`).
+def streaming_text(int64 status, fn(StreamWriter) -> int64 produce) -> Response:
+    return streaming_response(status, "text/plain; charset=utf-8", produce)
 
 # Return a copy of `r` with the header `name: value` set. Functional: a middleware
 # treats the Response `next` produced as immutable and returns a NEW value, so
 # `dict.copy()` gives each returned Response its own header map rather than
-# aliasing and mutating a shared one.
+# aliasing and mutating a shared one. The streaming shape (`streaming`, `produce`)
+# is carried through unchanged, so a middleware can decorate a streamed response's
+# headers (they ride in the chunked head) without materializing its body.
 def with_header(Response r, str name, str value) -> Response:
     auto h = r.headers.copy()
     h[name] = value
-    return Response(r.status, r.content_type, r.body, h)
+    return Response(r.status, r.content_type, r.body, h, r.streaming, r.produce)
 
 # A response header previously set via `with_header` ("" when absent).
 def response_header(Response r, str name) -> str:
@@ -626,6 +682,49 @@ def default_shutdown() -> ShutdownConfig:
     return ShutdownConfig(2000, 25000, "/healthz")
 
 # ---------------------------------------------------------------------------
+# Server / keep-alive configuration (fastzap#6, D-FZ-0014)
+# ---------------------------------------------------------------------------
+
+# Connection-handling knobs. `keep_alive` is the master switch for HTTP/1.1
+# connection reuse (fastzap#6); with it off, every response carries
+# `Connection: close` and the connection serves exactly one request (the v1
+# behavior). `max_keepalive_requests` caps how many requests one connection may
+# serve before the server closes it (a standard keep-alive hardening knob — it
+# bounds per-connection resource use); reach it and the final response carries
+# `Connection: close`. The knobs live on a free-function constructor, not as
+# method defaults (zaplang-io/zap#481 miscompiles method default args).
+struct ServerConfig:
+    bool keep_alive
+    int64 max_keepalive_requests
+
+# Build a server configuration (keyword args let a caller set only what it needs).
+def server_config(
+    bool keep_alive = True,
+    int64 max_keepalive_requests = 100,
+) -> ServerConfig:
+    return ServerConfig(keep_alive, max_keepalive_requests)
+
+# Defaults: keep-alive ON (HTTP/1.1 parity), up to 100 requests per connection.
+def default_server_config() -> ServerConfig:
+    return ServerConfig(True, 100)
+
+# Decide whether to keep a connection alive after a response, from the request's
+# `Connection` header value and whether a graceful shutdown has begun. Pure, so it
+# is unit-testable without a socket. HTTP/1.1 defaults to keep-alive, so the
+# connection is reused UNLESS the client asked to close (`Connection: close`) or
+# shutdown is in progress (then the connection drains and closes). The stdlib
+# `http.read_request` does not expose the request's HTTP version, so the decision
+# keys off the `Connection` header and defaults to keep-alive (see D-FZ-0014 and
+# zaplang-io/zap#486); an HTTP/1.0 client that does not want reuse simply
+# closes its side, which ends the server's read loop on the next request.
+def connection_keep_alive(str connection_value, bool shutting_down) -> bool:
+    if shutting_down:
+        return False
+    if connection_value.lower().contains("close"):
+        return False
+    return True
+
+# ---------------------------------------------------------------------------
 # OpenAPI / interactive-docs configuration (fastzap#3, D-FZ-0012)
 # ---------------------------------------------------------------------------
 
@@ -720,6 +819,7 @@ struct App:
     ShutdownConfig shutdown
     DocsConfig docs
     list[Middleware] middlewares
+    ServerConfig server
 
     # Register a handler for an arbitrary method + path template.
     def route(self, str method, str path, fn(Request) -> Response h):
@@ -781,6 +881,12 @@ struct App:
     def configure_shutdown(self, ShutdownConfig cfg):
         self.shutdown = cfg
 
+    # Replace the server / keep-alive configuration (fastzap#6). Build the config
+    # with the free function `server_config(keep_alive=.., max_keepalive_requests=..)`
+    # — defaults live there, not on this method (zaplang-io/zap#481).
+    def configure_server(self, ServerConfig cfg):
+        self.server = cfg
+
     # Replace the OpenAPI / interactive-docs configuration (fastzap#3).
     def configure_docs(self, DocsConfig cfg):
         self.docs = cfg
@@ -826,7 +932,7 @@ def app() -> App:
     list[Route] rs = []
     auto st = ServerState(True, False, Stage.Running, 0)
     list[Middleware] ms = []
-    return App(rs, st, default_shutdown(), default_docs(), ms)
+    return App(rs, st, default_shutdown(), default_docs(), ms, default_server_config())
 
 # Resolve a request to a response, running the registered middleware chain around
 # the route dispatch (fastzap#2). With no middleware this is exactly
@@ -1219,12 +1325,18 @@ def docs_html(App app) -> str:
 # Start serving and block until a staged graceful shutdown completes.
 #
 # The accept loop and both signal watchers live in one structured-concurrency
-# `scope:`. Each accepted connection is handled by an OWNED spawned coroutine, so
-# the scope's join barrier at the dedent is exactly the in-flight drain: control
-# does not leave until every handler has finished. On SIGTERM (or SIGINT for
+# `scope:`. Each accepted connection is handled by an OWNED spawned coroutine
+# running the HTTP/1.1 keep-alive loop (`_serve_connection`, fastzap#6), so the
+# scope's join barrier at the dedent is exactly the in-flight drain: control does
+# not leave until every connection's loop has finished. On SIGTERM (or SIGINT for
 # local dev) a watcher runs the staged drain (see `_trigger_shutdown`); closing
-# the listener makes `net.accept` raise, which breaks the accept loop and lets
-# the scope proceed to its join.
+# the listener makes `net.accept` raise, which breaks the accept loop and lets the
+# scope proceed to its join. A busy keep-alive connection closes after its current
+# request (its loop checks the shutdown latch between requests); a connection
+# idle-parked on the next read is reclaimed by the grace-timer backstop within the
+# grace budget — in-flight requests are drained, so no request is dropped. A
+# prompt idle-connection close on shutdown awaits a stdlib socket read deadline
+# (`net.recv` has no deadline today; see D-FZ-0014 and zaplang-io/zap#485).
 def run(App app, str host, int64 port):
     auto listener = net.listen(host, port)
     app.state.ready = True
@@ -1294,17 +1406,68 @@ def _grace_timer(App app):
         return
     sys.exit(0)
 
-# Handle one connection: parse, dispatch, write, close. Catches EVERYTHING — a
-# handler coroutine must never let an exception escape, or the request scope
-# would cancel its siblings (one malformed request would take down in-flight
-# peers). A parse failure becomes 400; any handler/dispatch failure becomes 500.
+# Handle one connection, then close it. The per-connection request loop
+# (`_serve_connection`) is the HTTP/1.1 keep-alive seam (fastzap#6); the single
+# `_close` here is the one place the socket is torn down, whether the loop served
+# one request or many.
 def _handle(App app, bytes conn):
-    app.state.active = app.state.active + 1
+    _serve_connection(app, conn)
+    _close(conn)
+
+# The HTTP/1.1 keep-alive request loop (fastzap#6, D-FZ-0014). Read a request,
+# run it through the middleware chain + router, write the response, then LOOP for
+# the next request on the SAME connection. The loop ends when:
+#   * the request or the response negotiated close (`Connection: close`, or
+#     keep-alive disabled) — `_serve_one` returns False;
+#   * the connection ended (client closed / incomplete request / parse error) —
+#     `_serve_one` returns False;
+#   * a graceful shutdown has begun (checked between requests, so the connection
+#     drains instead of parking on the next read across the grace deadline);
+#   * the per-connection request cap (`max_keepalive_requests`) is reached.
+# Each request is served in its own `scope:` (#50) inside `_answer`, so one
+# request's spawned work never leaks into the next on a kept-alive connection.
+def _serve_connection(App app, bytes conn):
+    auto served = 0
+    auto open = True
+    while open:
+        if app.state.triggered:
+            open = False
+        else:
+            auto keep = _serve_one(app, conn)
+            served = served + 1
+            if keep == False:
+                open = False
+            else:
+                if served >= app.server.max_keepalive_requests:
+                    open = False
+
+# Read and answer ONE request on the connection. Returns whether to keep the
+# connection alive for another request. A failed read (client closed / incomplete
+# request) ends the connection with no response — distinct from a handler failure,
+# which `_answer` maps to a 500 while the connection decision still applies.
+def _serve_one(App app, bytes conn) -> bool:
     try:
         auto reqh = http.read_request(conn)
-        auto req = _build_request(reqh)
-        auto resp = dispatch(app, req)
-        _write(conn, resp)
+        return _answer(app, conn, reqh)
+    except:
+        # `http.read_request` raised a (catchable) parse/EOF fault: no request to
+        # answer on this connection. `_answer` is itself exception-free, so this
+        # except only ever catches the read.
+        return False
+
+# Dispatch one already-read request and write its response, inside a per-request
+# structured-concurrency `scope:` (#50). Catches EVERYTHING so a handler coroutine
+# never lets an exception escape (an escaped exception would cancel the request
+# scope and take down in-flight peers): a handler/dispatch failure BEFORE any
+# bytes are written becomes a 500. A streaming producer failure is contained in
+# `_write_stream` (the head is already on the wire), so it never reaches this
+# backstop and never double-writes. Returns the keep-alive decision for the loop.
+def _answer(App app, bytes conn, bytes reqh) -> bool:
+    app.state.active = app.state.active + 1
+    auto keep = False
+    try:
+        scope:
+            keep = _respond(app, conn, reqh)
     except:
         _write_safe(
             conn,
@@ -1314,8 +1477,76 @@ def _handle(App app, bytes conn):
                 "{\"detail\":\"internal server error\"}",
             ),
         )
-    _close(conn)
+        keep = False
     app.state.active = app.state.active - 1
+    return keep
+
+# Build the Request, decide keep-alive, dispatch through the middleware chain, and
+# write the response. Runs inside the per-request scope opened by `_answer`.
+# Returns the keep-alive decision, forced to close if the write did not complete
+# cleanly (a truncated stream).
+def _respond(App app, bytes conn, bytes reqh) -> bool:
+    auto req = _build_request(reqh)
+    auto keep = _keep_alive(req, app)
+    auto resp = dispatch(app, req)
+    auto ok = _write_response(conn, resp, keep)
+    if ok == False:
+        return False
+    return keep
+
+# The keep-alive decision for one request: off when the server disables keep-alive
+# (one request per connection, the v1 behavior), otherwise per the request's
+# `Connection` header and the lifecycle (`connection_keep_alive`).
+def _keep_alive(Request req, App app) -> bool:
+    if app.server.keep_alive == False:
+        return False
+    return connection_keep_alive(req.header("connection"), app.state.triggered)
+
+# Write a response on the connection. A buffered response is serialized whole with
+# the negotiated `Connection` token; a streaming response is written as a chunked
+# head + pumped chunks + terminator (`_write_stream`). Returns whether the write
+# completed cleanly (always True for a buffered response).
+def _write_response(bytes conn, Response r, bool keep_alive) -> bool:
+    if r.streaming:
+        return _write_stream(conn, r, keep_alive)
+    auto out = wire.build_response_keepalive(
+        r.status,
+        r.content_type,
+        r.body,
+        r.headers,
+        keep_alive,
+    )
+    auto _n = net.send(conn, out)
+    return True
+
+# Write a streaming response as `Transfer-Encoding: chunked` (fastzap#6): the head
+# (no Content-Length), then the handler's producer pumped chunk-by-chunk through a
+# `StreamWriter` whose sink frames + sends each chunk, then the terminating
+# zero-length chunk. A producer that fails mid-stream is contained here — the body
+# is terminated cleanly and the connection is closed (we return False), since the
+# status line is already on the wire and cannot be changed to a 500.
+def _write_stream(bytes conn, Response r, bool keep_alive) -> bool:
+    auto head = wire.build_chunked_head(r.status, r.content_type, r.headers, keep_alive)
+    auto _h = net.send(conn, head)
+    auto w = _conn_writer(conn)
+    auto ok = True
+    try:
+        fn(StreamWriter) -> int64 p = r.produce
+        auto _c = p(w)
+    except:
+        ok = False
+    auto _t = net.send(conn, wire.chunk_final())
+    return ok
+
+# A `StreamWriter` bound to a connection: its `emit` sink frames each chunk with
+# `wire.chunk_encode` and sends it. The closure is the server-side counterpart of
+# the collecting sink a streaming test uses (D-FZ-0014).
+def _conn_writer(bytes conn) -> StreamWriter:
+    fn(str) -> int64 emit = lambda chunk: _send_chunk(conn, chunk)
+    return StreamWriter(emit)
+
+def _send_chunk(bytes conn, str chunk) -> int64:
+    return net.send(conn, wire.chunk_encode(chunk))
 
 def _build_request(bytes reqh) -> Request:
     auto method = http.method(reqh)
@@ -1337,6 +1568,7 @@ def _collect_headers(dict[str, str] into, bytes reqh):
         "host",
         "content-type",
         "content-length",
+        "connection",
         "accept",
         "authorization",
         "user-agent",
@@ -1348,10 +1580,6 @@ def _collect_headers(dict[str, str] into, bytes reqh):
         if len(v) > 0:
             into[names[i]] = v
         i = i + 1
-
-def _write(bytes conn, Response r):
-    auto out = wire.build_response_with(r.status, r.content_type, r.body, r.headers)
-    auto _n = net.send(conn, out)
 
 def _write_safe(bytes conn, str bytes_out):
     try:

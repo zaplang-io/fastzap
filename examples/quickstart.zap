@@ -10,6 +10,7 @@
 #   curl localhost:8000/db                     # a Depends(...) injected dependency
 #   curl -XPOST localhost:8000/items -d '{"name":"Book","price":9.5}'   # 201
 #   curl -XPOST localhost:8000/items -d '{"name":"","price":-1}'        # 422
+#   curl -N localhost:8000/events              # a chunked/streaming body
 #   curl localhost:8000/openapi.json           # the generated OpenAPI 3 document
 #   open  localhost:8000/docs                  # interactive Swagger UI
 #   curl localhost:8000/healthz                # readiness (200, 503 while draining)
@@ -90,6 +91,23 @@ def create_item(fastzap.Request req) -> fastzap.Response:
         case validation.ValidationResult.Err(errs):
             return fastzap.validation_error(errs)
 
+# A STREAMING response (fastzap#6, DECISIONS.md D-FZ-0014): the body is produced
+# incrementally and framed with `Transfer-Encoding: chunked`, so a large or
+# open-ended body is never buffered whole. The producer receives a `StreamWriter`
+# and calls `w.write(chunk)` per piece; the handler stays `fn(Request) ->
+# Response` — streaming is just a Response SHAPE, built with `streaming_text` /
+# `streaming_response`.
+def _events_body(fastzap.StreamWriter w) -> int64:
+    auto i = 0
+    while i < 5:
+        w.write("event " + str(i) + "\n")
+        i = i + 1
+    return 5
+
+@app.get("/events")
+def stream_events(fastzap.Request req) -> fastzap.Response:
+    return fastzap.streaming_text(200, _events_body)
+
 def main():
     # The `@app.get`/`@app.post` registrations above are spliced in here, right
     # after this binding, in source order — equivalent to calling
@@ -125,6 +143,13 @@ def main():
     # total, comfortably under the k8s default terminationGracePeriodSeconds (30s)
     # so the process is never SIGKILLed mid-request.
     app.configure_shutdown(fastzap.shutdown_config(3000, 20000, "/healthz"))
+
+    # HTTP/1.1 keep-alive is ON by default (fastzap#6, D-FZ-0014): a connection is
+    # reused for successive requests and closed on `Connection: close`, when the
+    # per-connection request cap is reached, or once the graceful drain begins.
+    # Raise the cap for a chatty client (or `server_config(keep_alive=False)` to
+    # serve one request per connection, the v1 behavior).
+    app.configure_server(fastzap.server_config(max_keepalive_requests=1000))
 
     print("fastzap listening on 0.0.0.0:8000 (SIGTERM for a graceful drain)")
     fastzap.run(app, "0.0.0.0", 8000)

@@ -57,13 +57,45 @@ For each accepted connection, in its own coroutine (`_handle`):
    runs. The matched handler then runs — reading coerced values off `req.param_*`
    and doing typed-model work (`req.validate(schema)`) via the `validation`
    package inside the handler.
-5. The `Response` is serialized by `wire.build_response` and written with
-   `net.send`, then the connection is closed.
+5. The `Response` is serialized and written with `net.send`. A buffered response
+   goes out whole with a byte-accurate `Content-Length`; a **streaming** response
+   (fastzap#6) is written as a `Transfer-Encoding: chunked` head + pumped chunks +
+   terminator. The `Connection` header reflects the negotiated keep-alive
+   decision, and the connection loops for the next request unless it is closing.
 
 `http.respond` is intentionally **not** used: it hard-codes `text/plain` and
 Connection: close with no control over the content type or headers. fastzap
 writes its own response bytes via `net.send` so a JSON API sends
-`application/json` (and so custom headers can be added later).
+`application/json`, custom/middleware headers ride along, and keep-alive +
+chunked framing are under fastzap's control.
+
+### Keep-alive + streaming (fastzap#6, D-FZ-0014)
+
+Steps 1–5 run in a **per-connection loop** (`_serve_connection`): read a request,
+dispatch, write, then loop for the next request on the same connection (HTTP/1.1
+keep-alive). The loop ends when the request/response negotiated close
+(`Connection: close`, or keep-alive disabled via `configure_server`), the
+connection ended (client closed / incomplete request — `http.read_request` raises
+a catchable fault), the per-connection request cap (`max_keepalive_requests`) is
+reached, or a graceful drain has begun (checked between requests). Framing is by
+`Content-Length` (`http.read_request` reads exactly the body, leaving the socket
+at the next request), so sequential requests parse correctly; HTTP **pipelining**
+is not supported (bytes past one request's Content-Length in the same read are
+discarded — documented, not a silent corruption). Each request still runs in its
+**own `scope:`** (#50) inside the loop, so a handler's spawned work never leaks
+into the next request.
+
+A **streaming** response is a Response SHAPE, not a new handler signature — the
+uniform `fn(Request) -> Response` contract (D-FZ-0001) is unchanged.
+`streaming_response(status, content_type, produce)` carries a `produce` closure
+(`fn(StreamWriter) -> int64`); the server writes the chunked head, then calls
+`produce(w)` where `w.write(chunk)` frames each chunk (`<hex>\r\n<bytes>\r\n`, an
+empty chunk dropped), then writes the terminating `0\r\n\r\n`. `StreamWriter`'s
+byte sink is an `fn(str) -> int64` closure — the server's sends on the socket, a
+test's collects into a list, so the incremental producer is unit-testable with no
+socket. A producer that fails mid-stream is contained (the head is already on the
+wire): the body is terminated cleanly and the connection closed, never a bogus
+500 over a partial body.
 
 ### Error isolation
 
@@ -88,7 +120,15 @@ scope:
 
 - **Per-request scope / drain for free.** Each `_handle` is an *owned* spawn, so
   the scope's join barrier at the dedent is exactly the in-flight drain: control
-  does not pass the dedent until every handler has returned.
+  does not pass the dedent until every connection's keep-alive loop has returned.
+  With keep-alive (fastzap#6), a **busy** connection checks the shutdown latch
+  between requests and closes after its current request; a connection **idle**
+  parked on the next read is reclaimed by the grace-timer backstop (below) within
+  the grace budget — in-flight requests are drained either way, so none is
+  dropped. A prompt idle-connection close on shutdown wants a stdlib socket read
+  deadline, which `net.recv` does not expose today (the netpoller supports
+  `deadline_ns` but it is unplumbed, and `scope(timeout=…)` is reserved-but-
+  deferred); filed as zaplang-io/zap#485. See D-FZ-0014.
 - **Watchers are detached.** Each waits on one `signal.notify` channel. They are
   detached so the watcher for a signal that never fires does not block the join.
 - **The staged drain** (`_trigger_shutdown`, one-shot via a latch that is safe
@@ -159,6 +199,18 @@ while authoring — every `.zap` here was checked with a front-end-only `zap`
   required param and an unparsable int/bool each produce a field-located 422,
   multiple failures collect into one 422, and the lenient `query_int(name,
   fallback)` accessor is unchanged on a route that declares no specs.
+- `tests/keepalive_test.zap` — HTTP/1.1 keep-alive + chunked/streaming
+  (fastzap#6, D-FZ-0014), all **without a socket**: the keep-alive decision
+  (`connection_keep_alive`, a pure fn) for default/explicit keep-alive, honoring
+  `Connection: close`, and shutdown forcing close; the buffered wire framing
+  (correct Content-Length + the negotiated Connection token, no Transfer-Encoding)
+  and the chunked framing (hex sizes incl. multi-digit, a chunk's exact bytes, the
+  `0\r\n\r\n` terminator, a chunked head with Transfer-Encoding and no
+  Content-Length); `dechunk` as the inverse of `chunk_encode`, so an encode→decode
+  round-trip returns the original body a client reassembles; and the streaming
+  Response shape through `dispatch` (a handler returns `streaming_response`; its
+  producer, pumped through a *collecting* `StreamWriter`, yields the expected
+  chunks — an empty chunk dropped — which reassemble into the full body).
 - `tests/shutdown_test.zap` — the staged drain over the **real signal path**:
   `signal.notify(SIGTERM)` + `__raise_signal(15)` + `__signal_drain()` deliver
   the signal deterministically (exactly as the compiler's own signal goldens do),

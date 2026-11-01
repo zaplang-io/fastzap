@@ -1,0 +1,38 @@
+ok ka default
+ok ka explicit
+ok ka close honored
+ok ka close ci
+ok ka shutdown closes
+ok buffered status line
+ok buffered content-length
+ok buffered keepalive token
+ok buffered no chunked
+ok buffered body after blank
+ok buffered close token
+ok build_response closes
+ok hex 0
+ok hex 5
+ok hex 16
+ok hex 255
+ok hex 4096
+ok chunk encode
+ok chunk final
+ok chunked transfer-encoding
+ok chunked no content-length
+ok chunked keepalive token
+ok chunked head ends blank
+ok dechunk round trip
+ok dechunk multi-hex
+ok stream flagged
+ok stream status
+ok stream content-type
+ok stream empty buffered body
+ok stream chunk count
+ok stream chunk 0
+ok stream chunk 1
+ok stream chunk 2
+ok stream client reassembles
+ok buffered not streaming
+ok streaming_text flagged
+ok streaming_text content-type
+all tests passed

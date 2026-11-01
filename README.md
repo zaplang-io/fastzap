@@ -300,6 +300,46 @@ def require_auth(
 configurable built-in (`cors(origin)`, `request_id_header(name)`) captures its
 config in its constructor. See [DECISIONS.md](DECISIONS.md) (D-FZ-0013).
 
+## Keep-alive & streaming responses
+
+fastzap speaks **HTTP/1.1 keep-alive**: a connection is reused for successive
+requests and closed on `Connection: close`, when a per-connection request cap is
+reached, or when the graceful drain begins. It's on by default; tune it (or turn
+it off for one request per connection) with `configure_server`:
+
+```zap
+# reuse a connection for up to 1000 requests (default 100); keep_alive=False
+# restores one-request-per-connection.
+app.configure_server(fastzap.server_config(max_keepalive_requests=1000))
+```
+
+A response body can be **streamed** incrementally with `Transfer-Encoding:
+chunked` instead of being buffered whole — for large or open-ended bodies. It's a
+Response *shape*, so the handler stays `fn(Request) -> Response`: return a
+`streaming_response` (or `streaming_text`) carrying a producer that writes chunks
+into a `StreamWriter`.
+
+```zap
+# The producer is handed a StreamWriter; each w.write(chunk) is sent as one
+# chunk. An empty write is skipped (a zero-length chunk ends the body).
+def _events(fastzap.StreamWriter w) -> int64:
+    auto i = 0
+    while i < 5:
+        w.write("event " + str(i) + "\n")
+        i = i + 1
+    return 5
+
+@app.get("/events")
+def stream_events(fastzap.Request req) -> fastzap.Response:
+    return fastzap.streaming_text(200, _events)   # chunked text/plain
+```
+
+To stream per-request data, close over it in a `lambda w: ...` producer. A
+chunked response omits `Content-Length` (the two are mutually exclusive) and ends
+with the terminating `0\r\n\r\n` chunk. HTTP pipelining is not supported, and a
+per-connection idle/read timeout awaits a stdlib socket read deadline — see
+[DECISIONS.md](DECISIONS.md) (D-FZ-0014).
+
 ## Graceful shutdown (zero dropped requests)
 
 On **SIGTERM** (and SIGINT for local dev) fastzap runs a **staged drain**, not a
@@ -383,13 +423,17 @@ handler parameters with a `Depends(provider)` default, resolved deps-first and
 once per request by a compiler-synthesized adapter (zaplang-io/zap#466, D-0092) —
 and strict typed-param coercion with a `422` via explicit param specs (D-FZ-0011).
 
-**Deferred follow-ups** (tracked against the #312 epic #432): OpenAPI/Swagger
-generation (which will walk each route's param specs), typed per-parameter
+**Also in v1:** HTTP/1.1 keep-alive and `Transfer-Encoding: chunked` streaming
+responses (D-FZ-0014) — a per-connection keep-alive request loop and a
+`streaming_response` body shape, with the uniform handler contract unchanged.
+
+**Deferred follow-ups** (tracked against the #312 epic #432): typed per-parameter
 path/query/body *injection into the signature* (a `@query`/`@path` source
 annotation, distinct from `Depends` and from the framework-side spec surface that
-shipped), HTTPS/TLS termination, and keep-alive / streaming bodies. OpenAPI/Swagger
-generation (D-FZ-0012) and the middleware/filter chain (D-FZ-0013) have since
-shipped. See [DECISIONS.md](DECISIONS.md).
+shipped), HTTPS/TLS termination, HTTP pipelining, and a per-connection idle/read
+timeout (awaiting a stdlib `net.recv` read deadline). OpenAPI/Swagger generation
+(D-FZ-0012), the middleware/filter chain (D-FZ-0013), and keep-alive + streaming
+(D-FZ-0014) have since shipped. See [DECISIONS.md](DECISIONS.md).
 
 ## License
 
