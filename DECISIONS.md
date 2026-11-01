@@ -533,6 +533,90 @@ touching handlers. `tests/middleware_test.zap` exercises ordering, short-circuit
 request-id propagate+generate, CORS (+preflight), the error-mapper, and a combined
 stack, all through the real `dispatch` chain without a socket.
 
+## D-FZ-0014 — HTTP/1.1 keep-alive + chunked / streaming response bodies
+
+**Decision.** fastzap serves each connection with an **HTTP/1.1 keep-alive request
+loop** and can emit a response body **incrementally** with `Transfer-Encoding:
+chunked`. v1's "read one request → respond → close" becomes a per-connection loop
+(`_serve_connection`): read a request, run it through the middleware chain +
+router, write the response, **loop** for the next request on the same connection.
+Streaming is a new Response **shape** (`streaming_response(...)`), not a new
+handler signature — the uniform `fn(Request) -> Response` contract
+([D-FZ-0001](#d-fz-0001--method-call-routing-not-the-appget-decorator)) is
+unchanged. Closes fastzap#6.
+
+**Keep-alive negotiation.** HTTP/1.1 defaults to keep-alive, so the connection is
+reused unless the request carries `Connection: close`, keep-alive is disabled
+(`configure_server(server_config(keep_alive=False))`), the per-connection request
+cap `max_keepalive_requests` is reached, a graceful drain has begun, or the
+connection ends. The decision is a **pure** function `connection_keep_alive(conn_
+header, shutting_down)` (unit-tested without a socket); the response's
+`Connection` header reflects it (`wire.build_response_keepalive`). The stdlib
+`http.read_request` does **not** expose the request's HTTP version (only
+method/path/headers/body), so the server cannot distinguish 1.0 from 1.1 and keys
+off the `Connection` header, defaulting to keep-alive — an HTTP/1.0 client that
+does not want reuse closes its own side, ending the read loop. Exposing the
+request version is a **filed stdlib follow-up** (zaplang-io/zap#486).
+
+**Framing + no pipelining.** `http.read_request` reads exactly the Content-Length
+body and leaves the socket at the next request, so **sequential** requests parse
+correctly in the loop. It buffers each request in a per-call buffer and discards
+anything past one request's Content-Length, so **HTTP pipelining is not
+supported** — a correctness boundary, documented, not a silent corruption (the
+overwhelmingly common client pattern is request→response→request). Buffered
+responses keep a byte-accurate `Content-Length`; a chunked response omits it (the
+two are mutually exclusive).
+
+**Streaming surface — a producer closure the server pumps.** `Response` gains
+`bool streaming` + `fn(StreamWriter) -> int64 produce`. `streaming_response(status,
+content_type, produce)` (and `streaming_text`) build one; a buffered builder sets
+`streaming = False, produce = _no_body`. The server writes the chunked head
+(`build_chunked_head` — `Transfer-Encoding: chunked`, no Content-Length), then
+calls `produce(w)` where `w.write(chunk)` frames one chunk
+(`chunk_encode`: `<hex-len>\r\n<bytes>\r\n`, an **empty chunk dropped** — a
+zero-length chunk is the terminator), then writes `chunk_final()` (`0\r\n\r\n`).
+`StreamWriter`'s byte sink is an `fn(str) -> int64` closure, which is why the
+incremental producer is **testable with no socket**: the server's sink
+(`_conn_writer`) sends each framed chunk on the connection, while a test's sink
+collects the raw chunks into a list, through the exact same `w.write` path.
+`dechunk` is the inverse of the encoder, so a test asserts the exact body a client
+reassembles. A producer that **fails mid-stream** is contained in `_write_stream`
+(the status line is already on the wire and cannot be changed to a 500): the body
+is terminated cleanly and the connection closed. Rejected a generator/`yield`
+producer (zaplang-io/zap#67) — generator-as-struct-field / generator methods are
+new and partly WIP (zap#429/#451); the fn-value closure uses only the sound
+first-class-fn / coercion capabilities (zap#163/#465) the middleware chain already
+relies on. Rejected a `Body` enum variant on `Response` — it would churn every
+`Response` construction site and `with_header`; a `streaming` discriminator +
+`produce` field is additive and carries through `with_header` unchanged.
+
+**Per-request scope preserved.** Each request in the keep-alive loop runs inside
+its own `scope:` (#50) in `_answer`, so a handler's spawned tasks are joined before
+the next request and never leak across requests on a kept-alive connection.
+
+**Drain composes with keep-alive.** A **busy** connection checks the shutdown
+latch between requests and closes after its current request (prompt). A connection
+**idle**-parked on the next read is reclaimed by the existing grace-timer backstop
+within the grace budget; in-flight requests drain either way, so the
+zero-dropped-requests criterion
+([D-FZ-0003](#d-fz-0003--staged-graceful-shutdown-not-cancel)) still holds. A
+**prompt** idle-connection close (and a general per-connection idle/read timeout)
+wants a stdlib socket **read deadline**, which `net.recv` does not expose today —
+the netpoller already takes a `deadline_ns` but `net`/`http` hard-code `0` (park
+forever), and `scope(timeout=…)` is reserved-but-deferred in the grammar. Under
+the M:N scheduler (zap#47) a shared open-connection registry would be
+unsynchronized shared mutable state against fastzap's own convention
+([D-FZ-0006](#d-fz-0006--plain-serverstate-flags-not-atomics)), so fastzap does
+**not** add one; the read deadline is the right fix and is a **filed stdlib
+follow-up** (zaplang-io/zap#485). Documented, not worked around.
+
+**Configuration without method default args.** The knobs live on a free-function
+constructor `server_config(keep_alive=True, max_keepalive_requests=100)` and are
+installed with `app.configure_server(cfg)` — defaults never ride on a method
+(zaplang-io/zap#481 miscompiles method default args), exactly as `ShutdownConfig` /
+`DocsConfig` do. `wire.build_response` / `build_response_with` keep `Connection:
+close`, so the pre-existing wire golden and the error backstops are unchanged.
+
 ## Deferred to follow-up issues (against the #312 epic #432)
 
 Not blocking a coherent v1; noted so they are not forgotten:
@@ -554,8 +638,12 @@ Not blocking a coherent v1; noted so they are not forgotten:
   [D-FZ-0007](#d-fz-0007--app-get-decorator-routing-sugar).
 - **HTTPS/TLS termination** — the stdlib `http`/`net` is plaintext in v1; TLS
   (#147) is a follow-up.
-- **Keep-alive / streaming bodies** — v1 is one request per connection
-  (`Connection: close`).
+- **Keep-alive / streaming bodies** — **shipped**; an HTTP/1.1 keep-alive request
+  loop per connection and `Transfer-Encoding: chunked` streaming responses
+  (`streaming_response`), see
+  [D-FZ-0014](#d-fz-0014--http11-keep-alive--chunked--streaming-response-bodies).
+  A per-connection idle/read timeout and HTTP pipelining remain follow-ups (the
+  former wants a stdlib `net.recv` read deadline, filed as zaplang-io/zap#485).
 - **Strict typed-param coercion (422 on unparsable)** — **shipped** via an
   explicit param-spec surface; see
   [D-FZ-0011](#d-fz-0011--strict-typed-param-coercion--explicit-param-specs). The
