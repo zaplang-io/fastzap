@@ -153,3 +153,7 @@ def main():
 
     print("fastzap listening on 0.0.0.0:8000 (SIGTERM for a graceful drain)")
     fastzap.run(app, "0.0.0.0", 8000)
+    # To serve HTTPS instead (fastzap#5), swap `run` for `run_tls` with a PEM
+    # certificate chain + private key on disk — same app, same routes, same staged
+    # graceful drain, now over TLS:
+    #   fastzap.run_tls(app, "0.0.0.0", 8443, "cert.pem", "key.pem")

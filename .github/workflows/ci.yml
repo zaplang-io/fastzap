@@ -38,6 +38,8 @@ jobs:
           test -s tests/keepalive_test.expected
           test -f tests/shutdown_test.zap
           test -s tests/shutdown_test.expected
+          test -f tests/tls_test.zap
+          test -s tests/tls_test.expected
           test -f examples/quickstart.zap
           test -f DESIGN.md
           test -f DECISIONS.md

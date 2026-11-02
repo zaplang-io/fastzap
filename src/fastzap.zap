@@ -958,7 +958,7 @@ def _run_chain(App app, int64 i, Request req) -> Response:
 # The terminal of the middleware chain: resolve a request to a response — the
 # readiness endpoint first, then the route table (404 vs 405 distinguished), then
 # the handler. Never raises for a routing/validation outcome; a handler that
-# throws unwinds to the caller (the server's `_handle` backstop, or an
+# throws unwinds to the caller (the server's `_answer` backstop, or an
 # `error_mapper()` middleware if one is registered).
 def _dispatch_core(App app, Request req) -> Response:
     if req.path == app.shutdown.readiness_path:
@@ -1011,7 +1011,7 @@ def _dispatch_core(App app, Request req) -> Response:
 # any exception from an inner middleware or a handler unwinds through `next(req)`
 # to here and becomes a 500 `{"detail":"internal server error"}` — the same
 # envelope the server's connection backstop produces, now reified as a
-# composable, after-handling-aware layer. The server's `_handle` try/except
+# composable, after-handling-aware layer. The server's `_answer` try/except
 # remains the ultimate coroutine safety net (it must never let an exception
 # escape a handler coroutine); with this registered, a handler error is mapped to
 # a Response before it ever reaches that backstop. See D-FZ-0013.
@@ -1322,35 +1322,64 @@ def docs_html(App app) -> str:
 # Server (coroutine accept loop + staged graceful shutdown)
 # ---------------------------------------------------------------------------
 
-# Start serving and block until a staged graceful shutdown completes.
+# Start serving plaintext HTTP and block until a staged graceful shutdown
+# completes. The live accept/serve/drain machinery is shared with `run_tls` in
+# `_serve` below; `run` just creates a plaintext listener. For HTTPS use
+# `run_tls` (fastzap#5).
 #
-# The accept loop and both signal watchers live in one structured-concurrency
-# `scope:`. Each accepted connection is handled by an OWNED spawned coroutine
-# running the HTTP/1.1 keep-alive loop (`_serve_connection`, fastzap#6), so the
-# scope's join barrier at the dedent is exactly the in-flight drain: control does
-# not leave until every connection's loop has finished. On SIGTERM (or SIGINT for
-# local dev) a watcher runs the staged drain (see `_trigger_shutdown`); closing
-# the listener makes `net.accept` raise, which breaks the accept loop and lets the
-# scope proceed to its join. A busy keep-alive connection closes after its current
-# request (its loop checks the shutdown latch between requests); a connection
-# idle-parked on the next read is reclaimed by the grace-timer backstop within the
-# grace budget — in-flight requests are drained, so no request is dropped. A
-# prompt idle-connection close on shutdown awaits a stdlib socket read deadline
-# (`net.recv` has no deadline today; see D-FZ-0014 and zaplang-io/zap#485).
+# On SIGTERM (or SIGINT for local dev) a watcher runs the staged drain (see
+# `_trigger_shutdown`); closing the listener makes `accept` raise, which breaks
+# the accept loop and lets the scope proceed to its join. A busy keep-alive
+# connection closes after its current request (its loop checks the shutdown latch
+# between requests); a connection idle-parked on the next read is reclaimed by the
+# grace-timer backstop within the grace budget — in-flight requests are drained,
+# so no request is dropped. A prompt idle-connection close on shutdown awaits a
+# stdlib socket read deadline (`net.recv` has no deadline today; see D-FZ-0014 and
+# zaplang-io/zap#485).
 def run(App app, str host, int64 port):
     auto listener = net.listen(host, port)
+    _serve(app, listener, False)
+
+# Serve over TLS (HTTPS), the direct analogue of `run` (fastzap#5). `cert_path`
+# and `key_path` are PEM files on disk (a certificate chain and its private key),
+# loaded by the stdlib `tls.listen` server API (zaplang-io/zap#147/#488) into a
+# server context bound to host:port. Cert/key are serving parameters, so they sit
+# alongside host/port here rather than on an `App` config struct — `run`'s shape
+# is unchanged, and an existing plaintext app opts into TLS by switching `run` →
+# `run_tls` and supplying the two paths (uvicorn's `ssl_certfile`/`ssl_keyfile`).
+#
+# Everything past the transport is identical to plaintext: each accepted TLS
+# connection flows through the SAME request-parse (`http.read_request`, which the
+# stdlib transport seam of #556 drives over SSL_read for a TLS conn) → middleware
+# chain → dispatch → response-write path, and the staged graceful-shutdown
+# sequence is preserved verbatim (closing the TLS listener raises the parked
+# `tls.accept`, exactly as `net.close_listener` does for `net.accept`).
+def run_tls(App app, str host, int64 port, str cert_path, str key_path):
+    auto listener = tls.listen(host, port, cert_path, key_path)
+    _serve(app, listener, True)
+
+# The shared accept loop + staged graceful shutdown for both transports. `use_tls`
+# selects the transport for every per-connection I/O op (accept, send, close) and
+# for closing the listener on shutdown; the request read is transport-agnostic
+# (`http.read_request` dispatches on the connection's own kind tag, #556), so the
+# dispatch pipeline is byte-identical to the plaintext path. The accept loop and
+# both signal watchers live in one structured-concurrency `scope:`; each accepted
+# connection is handled by an OWNED spawned coroutine running the HTTP/1.1
+# keep-alive loop (`serve_conn`), so the scope's join barrier at the dedent is
+# exactly the in-flight drain.
+def _serve(App app, bytes listener, bool use_tls):
     app.state.ready = True
     app.state.stage = Stage.Running
     auto term = signal.notify(Signal.SIGTERM)
     auto intr = signal.notify(Signal.SIGINT)
     scope:
-        spawn detached _watch(app, listener, term)
-        spawn detached _watch(app, listener, intr)
+        spawn detached _watch(app, listener, use_tls, term)
+        spawn detached _watch(app, listener, use_tls, intr)
         auto accepting = True
         while accepting:
             try:
-                auto conn = net.accept(listener)
-                spawn _handle(app, conn)
+                auto conn = _accept(listener, use_tls)
+                spawn serve_conn(app, conn, use_tls)
             except:
                 # The listener was closed by the shutdown watcher: stop accepting
                 # and fall through to the scope join (drain in-flight requests).
@@ -1358,23 +1387,33 @@ def run(App app, str host, int64 port):
             checkpoint()
     app.state.stage = Stage.Done
 
+# Accept one connection off the listener, over the selected transport. Raises when
+# the listener is closed (the shutdown contract the accept loop relies on).
+def _accept(bytes listener, bool use_tls) -> bytes:
+    if use_tls:
+        return tls.accept(listener)
+    return net.accept(listener)
+
 # A signal watcher: wait for one delivery, then run the staged shutdown. Spawned
 # detached (two of them, one per signal) so an unfired watcher never blocks the
-# scope join.
-def _watch(App app, bytes listener, channel[Signal] ch):
+# scope join. `use_tls` selects the listener-close verb (see `_trigger_shutdown`).
+def _watch(App app, bytes listener, bool use_tls, channel[Signal] ch):
     auto _sig = <-ch
-    begin_shutdown(app, listener)
+    begin_shutdown(app, listener, use_tls)
 
 # Run the staged graceful-shutdown sequence against a listener. Normally invoked
-# by the signal watcher inside `run`; exposed so an admin route (or a test) can
-# trigger a drain programmatically. Idempotent (one-shot latch).
-def begin_shutdown(App app, bytes listener):
-    _trigger_shutdown(app, listener)
+# by the signal watcher inside `_serve`; exposed so an admin route (or a test) can
+# trigger a drain programmatically. Idempotent (one-shot latch). `use_tls` selects
+# the transport for closing the listener — it defaults to False so the existing
+# plaintext callers (and the shutdown golden) are unchanged; a TLS server passes
+# True (the internal watcher does so automatically via `run_tls`).
+def begin_shutdown(App app, bytes listener, bool use_tls = False):
+    _trigger_shutdown(app, listener, use_tls)
 
 # The staged drain (zaplang-io/zap#312 acceptance criterion). One-shot: under the
 # cooperative scheduler the latch check-and-set has no await between read and
 # write, so the two watchers cannot both pass it.
-def _trigger_shutdown(App app, bytes listener):
+def _trigger_shutdown(App app, bytes listener, bool use_tls):
     if app.state.triggered:
         return
     app.state.triggered = True
@@ -1386,11 +1425,12 @@ def _trigger_shutdown(App app, bytes listener):
     # removal is eventually consistent, so closing the listener immediately would
     # connection-refuse requests still being routed to us mid-propagation.
     _sleep_ms(app.shutdown.propagation_ms)
-    # Stage 3 — stop accepting: closing the listener unblocks `net.accept`, which
-    # raises and breaks the accept loop.
+    # Stage 3 — stop accepting: closing the listener unblocks the parked `accept`,
+    # which raises and breaks the accept loop. `tls.close_listener` wakes a parked
+    # `tls.accept` with CLOSED exactly as `net.close_listener` does `net.accept`.
     app.state.stage = Stage.Stopping
     try:
-        net.close_listener(listener)
+        _close_listener(listener, use_tls)
     except:
         auto _ig = 0
     # Stage 5 backstop — never be SIGKILLed mid-request: if in-flight work
@@ -1406,13 +1446,18 @@ def _grace_timer(App app):
         return
     sys.exit(0)
 
-# Handle one connection, then close it. The per-connection request loop
-# (`_serve_connection`) is the HTTP/1.1 keep-alive seam (fastzap#6); the single
-# `_close` here is the one place the socket is torn down, whether the loop served
-# one request or many.
-def _handle(App app, bytes conn):
-    _serve_connection(app, conn)
-    _close(conn)
+# Serve one already-accepted connection through the full request pipeline, then
+# close it. This is the seam `run`/`run_tls` spawn per accepted connection; it is
+# public so a custom accept loop (or an integration test) can drive the SAME
+# pipeline over a connection it accepted itself, for either transport. The
+# per-connection request loop (`_serve_connection`) is the HTTP/1.1 keep-alive
+# seam (fastzap#6); the single `_close` here is the one place the connection is
+# torn down, whether the loop served one request or many. `use_tls` selects the
+# transport for every send/close on this connection; the request read is
+# transport-agnostic (`http.read_request`, #556).
+def serve_conn(App app, bytes conn, bool use_tls):
+    _serve_connection(app, conn, use_tls)
+    _close(conn, use_tls)
 
 # The HTTP/1.1 keep-alive request loop (fastzap#6, D-FZ-0014). Read a request,
 # run it through the middleware chain + router, write the response, then LOOP for
@@ -1426,14 +1471,14 @@ def _handle(App app, bytes conn):
 #   * the per-connection request cap (`max_keepalive_requests`) is reached.
 # Each request is served in its own `scope:` (#50) inside `_answer`, so one
 # request's spawned work never leaks into the next on a kept-alive connection.
-def _serve_connection(App app, bytes conn):
+def _serve_connection(App app, bytes conn, bool use_tls):
     auto served = 0
     auto open = True
     while open:
         if app.state.triggered:
             open = False
         else:
-            auto keep = _serve_one(app, conn)
+            auto keep = _serve_one(app, conn, use_tls)
             served = served + 1
             if keep == False:
                 open = False
@@ -1445,10 +1490,10 @@ def _serve_connection(App app, bytes conn):
 # connection alive for another request. A failed read (client closed / incomplete
 # request) ends the connection with no response — distinct from a handler failure,
 # which `_answer` maps to a 500 while the connection decision still applies.
-def _serve_one(App app, bytes conn) -> bool:
+def _serve_one(App app, bytes conn, bool use_tls) -> bool:
     try:
         auto reqh = http.read_request(conn)
-        return _answer(app, conn, reqh)
+        return _answer(app, conn, reqh, use_tls)
     except:
         # `http.read_request` raised a (catchable) parse/EOF fault: no request to
         # answer on this connection. `_answer` is itself exception-free, so this
@@ -1462,15 +1507,16 @@ def _serve_one(App app, bytes conn) -> bool:
 # bytes are written becomes a 500. A streaming producer failure is contained in
 # `_write_stream` (the head is already on the wire), so it never reaches this
 # backstop and never double-writes. Returns the keep-alive decision for the loop.
-def _answer(App app, bytes conn, bytes reqh) -> bool:
+def _answer(App app, bytes conn, bytes reqh, bool use_tls) -> bool:
     app.state.active = app.state.active + 1
     auto keep = False
     try:
         scope:
-            keep = _respond(app, conn, reqh)
+            keep = _respond(app, conn, reqh, use_tls)
     except:
         _write_safe(
             conn,
+            use_tls,
             wire.build_response(
                 500,
                 "application/json",
@@ -1485,11 +1531,11 @@ def _answer(App app, bytes conn, bytes reqh) -> bool:
 # write the response. Runs inside the per-request scope opened by `_answer`.
 # Returns the keep-alive decision, forced to close if the write did not complete
 # cleanly (a truncated stream).
-def _respond(App app, bytes conn, bytes reqh) -> bool:
+def _respond(App app, bytes conn, bytes reqh, bool use_tls) -> bool:
     auto req = _build_request(reqh)
     auto keep = _keep_alive(req, app)
     auto resp = dispatch(app, req)
-    auto ok = _write_response(conn, resp, keep)
+    auto ok = _write_response(conn, resp, keep, use_tls)
     if ok == False:
         return False
     return keep
@@ -1506,9 +1552,9 @@ def _keep_alive(Request req, App app) -> bool:
 # the negotiated `Connection` token; a streaming response is written as a chunked
 # head + pumped chunks + terminator (`_write_stream`). Returns whether the write
 # completed cleanly (always True for a buffered response).
-def _write_response(bytes conn, Response r, bool keep_alive) -> bool:
+def _write_response(bytes conn, Response r, bool keep_alive, bool use_tls) -> bool:
     if r.streaming:
-        return _write_stream(conn, r, keep_alive)
+        return _write_stream(conn, r, keep_alive, use_tls)
     auto out = wire.build_response_keepalive(
         r.status,
         r.content_type,
@@ -1516,7 +1562,7 @@ def _write_response(bytes conn, Response r, bool keep_alive) -> bool:
         r.headers,
         keep_alive,
     )
-    auto _n = net.send(conn, out)
+    auto _n = _send(conn, use_tls, out)
     return True
 
 # Write a streaming response as `Transfer-Encoding: chunked` (fastzap#6): the head
@@ -1525,28 +1571,29 @@ def _write_response(bytes conn, Response r, bool keep_alive) -> bool:
 # zero-length chunk. A producer that fails mid-stream is contained here — the body
 # is terminated cleanly and the connection is closed (we return False), since the
 # status line is already on the wire and cannot be changed to a 500.
-def _write_stream(bytes conn, Response r, bool keep_alive) -> bool:
+def _write_stream(bytes conn, Response r, bool keep_alive, bool use_tls) -> bool:
     auto head = wire.build_chunked_head(r.status, r.content_type, r.headers, keep_alive)
-    auto _h = net.send(conn, head)
-    auto w = _conn_writer(conn)
+    auto _h = _send(conn, use_tls, head)
+    auto w = _conn_writer(conn, use_tls)
     auto ok = True
     try:
         fn(StreamWriter) -> int64 p = r.produce
         auto _c = p(w)
     except:
         ok = False
-    auto _t = net.send(conn, wire.chunk_final())
+    auto _t = _send(conn, use_tls, wire.chunk_final())
     return ok
 
 # A `StreamWriter` bound to a connection: its `emit` sink frames each chunk with
-# `wire.chunk_encode` and sends it. The closure is the server-side counterpart of
-# the collecting sink a streaming test uses (D-FZ-0014).
-def _conn_writer(bytes conn) -> StreamWriter:
-    fn(str) -> int64 emit = lambda chunk: _send_chunk(conn, chunk)
+# `wire.chunk_encode` and sends it over the connection's transport. The closure is
+# the server-side counterpart of the collecting sink a streaming test uses
+# (D-FZ-0014).
+def _conn_writer(bytes conn, bool use_tls) -> StreamWriter:
+    fn(str) -> int64 emit = lambda chunk: _send_chunk(conn, use_tls, chunk)
     return StreamWriter(emit)
 
-def _send_chunk(bytes conn, str chunk) -> int64:
-    return net.send(conn, wire.chunk_encode(chunk))
+def _send_chunk(bytes conn, bool use_tls, str chunk) -> int64:
+    return _send(conn, use_tls, wire.chunk_encode(chunk))
 
 def _build_request(bytes reqh) -> Request:
     auto method = http.method(reqh)
@@ -1581,17 +1628,42 @@ def _collect_headers(dict[str, str] into, bytes reqh):
             into[names[i]] = v
         i = i + 1
 
-def _write_safe(bytes conn, str bytes_out):
+# The transport read/write/close seam (fastzap#5). The whole request pipeline is
+# written once over these three helpers plus `_accept`/`_close_listener`; only
+# they know whether a connection is plaintext (`net`) or TLS (`tls`). The request
+# READ is NOT here — `http.read_request` reads the same opaque connection handle
+# for both transports (the stdlib dispatches on the handle's own kind tag, #556).
+
+# Send bytes over the connection, picking SSL_write (`tls.send`) or a raw socket
+# write (`net.send`). `net.send` does NOT itself detect a TLS handle, so a TLS
+# connection MUST route here with `use_tls = True` or it would write plaintext.
+def _send(bytes conn, bool use_tls, str data) -> int64:
+    if use_tls:
+        return tls.send(conn, data)
+    return net.send(conn, data)
+
+def _write_safe(bytes conn, bool use_tls, str bytes_out):
     try:
-        auto _n = net.send(conn, bytes_out)
+        auto _n = _send(conn, use_tls, bytes_out)
     except:
         auto _ig = 0
 
-def _close(bytes conn):
+def _close(bytes conn, bool use_tls):
     try:
-        net.close_conn(conn)
+        if use_tls:
+            tls.close_conn(conn)
+        else:
+            net.close_conn(conn)
     except:
         auto _ig = 0
+
+# Close the listener, waking a coroutine parked in `accept` so it raises and the
+# accept loop ends (the staged-shutdown contract, identical for both transports).
+def _close_listener(bytes listener, bool use_tls):
+    if use_tls:
+        tls.close_listener(listener)
+    else:
+        net.close_listener(listener)
 
 def _sleep_ms(int64 ms):
     if ms > 0:
