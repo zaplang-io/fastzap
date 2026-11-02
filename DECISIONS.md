@@ -617,6 +617,61 @@ installed with `app.configure_server(cfg)` — defaults never ride on a method
 `DocsConfig` do. `wire.build_response` / `build_response_with` keep `Connection:
 close`, so the pre-existing wire golden and the error backstops are unchanged.
 
+## D-FZ-0015 — HTTPS / TLS termination
+
+**Decision.** fastzap serves over TLS via a parallel entry point **`run_tls(app,
+host, port, cert_path, key_path)`**, the direct analogue of `run(app, host,
+port)`. Cert/key are PEM files on disk loaded by the stdlib `tls` server API
+(zaplang-io/zap#147 client half, #488 server half: `tls.listen` / `tls.accept` /
+`tls.port` / `tls.close_listener`). Closes fastzap#5.
+
+**`run_tls`, not TLS config on the `App`.** A certificate + key are *serving*
+parameters, in the same category as host and port — which `run` already takes as
+positional arguments rather than reading off an `App` config struct. `run_tls`
+keeps them together and leaves `run`'s signature (and every existing plaintext
+app) untouched: opting into HTTPS is a one-line `run` → `run_tls` switch plus the
+two paths. This mirrors `uvicorn.run(..., ssl_certfile=, ssl_keyfile=)`. The
+alternative — a `TlsConfig` with an `enabled` flag consumed by `run` — would split
+serving parameters across `run`'s args and an app struct and introduce an
+Optional-ish toggle for no gain.
+
+**One pipeline, a transport seam at the leaves.** `run` and `run_tls` share the
+accept loop + staged drain (`_serve(app, listener, use_tls)`); the request
+pipeline is **not** forked. A single `bool use_tls` threads through the server
+functions and selects the transport only at the leaf I/O operations —
+`_accept` (`tls.accept` vs `net.accept`), `_send` (`tls.send` vs `net.send`),
+`_close` (`tls.close_conn` vs `net.close_conn`) and `_close_listener`
+(`tls.close_listener` vs `net.close_listener`). The request **read** is *not*
+branched: `http.read_request(conn)` reads the same opaque connection handle for
+both transports because the stdlib dispatches on the handle's own kind tag
+(zaplang-io/zap#556), so parse → middleware → dispatch → response-build is
+byte-identical. The write seam exists because fastzap builds its own response
+bytes and sends them with `net.send`
+([D-FZ-0002](#d-fz-0002--write-response-bytes-directly-not-via-httprespond));
+`net.send` does **not** itself detect a TLS handle, so a TLS connection must route
+through `tls.send` — hence `_send`.
+
+**`serve_conn` made public.** The per-connection pipeline `run`/`run_tls` spawn
+per accepted connection is exposed as `serve_conn(app, conn, use_tls)` so a custom
+accept loop — or the round-trip test — can drive the SAME pipeline over a
+connection it accepted itself. It is the clean testable unit for the feature: the
+TLS round-trip golden (`tests/tls_test.zap`) binds a real loopback TLS listener,
+accepts one connection and runs it through `serve_conn`, with a `connect_insecure`
+client doing one request/response — mirroring zap's `http_over_tls` golden.
+
+**Graceful shutdown preserved verbatim.** `begin_shutdown` gained a defaulted
+`use_tls=False` parameter, so the existing plaintext callers and the shutdown
+golden are unchanged; the internal TLS watcher passes `True`. `tls.close_listener`
+wakes a parked `tls.accept` with CLOSED and makes it raise, exactly as
+`net.close_listener` does for `net.accept`, so the staged sequence (flip
+readiness → propagation window → stop accepting → drain in-flight via the scope
+join → grace-timer backstop) is identical on both transports.
+
+**Testing.** The round-trip is a LIVE loopback test (TLS cannot be exercised
+without a real handshake), so unlike the socket-free drivers its runtime behavior
+(handshake + SSL_read/SSL_write + the netpoller parks) is validated by CI in the
+toolchain image, not on the host. See DESIGN.md "Testing".
+
 ## Deferred to follow-up issues (against the #312 epic #432)
 
 Not blocking a coherent v1; noted so they are not forgotten:
@@ -636,8 +691,10 @@ Not blocking a coherent v1; noted so they are not forgotten:
   [D-FZ-0013](#d-fz-0013--middleware--filter-chain-the-onion-model).
 - **`@app.get` decorator sugar** — **shipped**; see
   [D-FZ-0007](#d-fz-0007--app-get-decorator-routing-sugar).
-- **HTTPS/TLS termination** — the stdlib `http`/`net` is plaintext in v1; TLS
-  (#147) is a follow-up.
+- **HTTPS/TLS termination** — **shipped**; `run_tls(app, host, port, cert_path,
+  key_path)` serves the whole pipeline over TLS via the stdlib `tls` server API
+  (#147/#488) and the transport-agnostic `http.read_request` (#556), see
+  [D-FZ-0015](#d-fz-0015--https--tls-termination).
 - **Keep-alive / streaming bodies** — **shipped**; an HTTP/1.1 keep-alive request
   loop per connection and `Transfer-Encoding: chunked` streaming responses
   (`streaming_response`), see

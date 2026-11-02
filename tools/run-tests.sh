@@ -55,5 +55,6 @@ run_one openapi_test
 run_one middleware_test
 run_one keepalive_test
 run_one shutdown_test
+run_one tls_test
 
 echo "fastzap offline suite: PASS"

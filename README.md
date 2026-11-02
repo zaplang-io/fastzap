@@ -340,6 +340,25 @@ with the terminating `0\r\n\r\n` chunk. HTTP pipelining is not supported, and a
 per-connection idle/read timeout awaits a stdlib socket read deadline — see
 [DECISIONS.md](DECISIONS.md) (D-FZ-0014).
 
+## HTTPS / TLS termination
+
+To serve over TLS, swap `run` for **`run_tls`** with a PEM certificate chain and
+its private key on disk — nothing else changes. The same app, routes, middleware,
+keep-alive and staged graceful drain all run over TLS; each accepted connection
+flows through the identical request-parse → dispatch → response-write pipeline,
+only over `SSL_read`/`SSL_write`:
+
+```zap
+# plaintext:  fastzap.run(app, "0.0.0.0", 8000)
+fastzap.run_tls(app, "0.0.0.0", 8443, "cert.pem", "key.pem")
+```
+
+`cert.pem` is a certificate (chain) and `key.pem` its private key, loaded by the
+stdlib `tls` server API (zaplang-io/zap#147/#488). The listener and each accepted
+connection are TLS; closing the listener on shutdown raises the parked accept
+exactly as the plaintext path does, so the staged drain below is preserved
+verbatim. See [DECISIONS.md](DECISIONS.md) (D-FZ-0015).
+
 ## Graceful shutdown (zero dropped requests)
 
 On **SIGTERM** (and SIGINT for local dev) fastzap runs a **staged drain**, not a
@@ -427,13 +446,18 @@ and strict typed-param coercion with a `422` via explicit param specs (D-FZ-0011
 responses (D-FZ-0014) — a per-connection keep-alive request loop and a
 `streaming_response` body shape, with the uniform handler contract unchanged.
 
+**Also in v1:** HTTPS/TLS termination (D-FZ-0015) — `run_tls(app, host, port,
+cert_path, key_path)` serves the whole pipeline (keep-alive, streaming, staged
+drain) over TLS, reusing the stdlib `tls` server API.
+
 **Deferred follow-ups** (tracked against the #312 epic #432): typed per-parameter
 path/query/body *injection into the signature* (a `@query`/`@path` source
 annotation, distinct from `Depends` and from the framework-side spec surface that
-shipped), HTTPS/TLS termination, HTTP pipelining, and a per-connection idle/read
-timeout (awaiting a stdlib `net.recv` read deadline). OpenAPI/Swagger generation
-(D-FZ-0012), the middleware/filter chain (D-FZ-0013), and keep-alive + streaming
-(D-FZ-0014) have since shipped. See [DECISIONS.md](DECISIONS.md).
+shipped), HTTP pipelining, and a per-connection idle/read timeout (now unblocked
+by the stdlib socket read deadline, zaplang-io/zap#485, but not yet wired in).
+OpenAPI/Swagger generation (D-FZ-0012), the middleware/filter chain (D-FZ-0013),
+keep-alive + streaming (D-FZ-0014), and HTTPS/TLS termination (D-FZ-0015) have
+since shipped. See [DECISIONS.md](DECISIONS.md).
 
 ## License
 
