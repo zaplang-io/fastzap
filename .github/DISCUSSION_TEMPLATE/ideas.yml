@@ -1,0 +1,32 @@
+# Discussion form for the "Ideas" category. GitHub applies a DISCUSSION_TEMPLATE
+# file only when a Discussions category with the matching slug exists (here:
+# "ideas"). Enable Discussions and create the categories listed in CONTRIBUTING.md
+# ("Where things go") for this and the config.yml contact links to resolve.
+# PORTABLE boilerplate.
+title: "[idea] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use **Ideas** to propose and refine a design before it becomes an issue.
+        A settled idea graduates to a feature issue plus a `DECISIONS.md` D-FZ entry.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: sketch
+    attributes:
+      label: Rough sketch of the API / behaviour
+      description: How might the eventual Zap code read? Prior art (FastAPI/Flask/etc.) welcome.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false

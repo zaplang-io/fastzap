@@ -1,0 +1,71 @@
+# PORTABLE across official Zap library repos. fastzap-specific bits are only the
+# examples in the placeholders; the structure is boilerplate.
+name: Bug report
+description: A reproducible defect in fastzap (wrong behaviour, crash, bad output).
+title: "bug: <short summary>"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. A good bug report is **reproducible and testable**.
+        Per our conventions, a fix lands with a **failing test written first**, so the
+        single most useful thing you can give us is the *smallest* code example that
+        reproduces the problem.
+
+        For open-ended questions or design ideas, use
+        [Discussions](https://github.com/zaplang-io/fastzap/discussions) instead.
+  - type: textarea
+    id: repro
+    attributes:
+      label: Smallest reproducing example
+      description: >
+        The minimal .zap snippet (handler + the request that triggers it) that shows
+        the bug. Trim everything not needed to reproduce.
+      render: python
+      placeholder: |
+        @app.get("/items/{id}")
+        def get_item(req: fastzap.Request) -> fastzap.Response:
+            return fastzap.json_response(200, {"id": req.path_param("id")})
+        # GET /items/%E2%9C%93  ->  ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include the exact status line / body / error / stack if any.
+    validations:
+      required: true
+  - type: input
+    id: location
+    attributes:
+      label: Suspected location (if known)
+      description: File, function and line you believe is responsible, e.g. `src/fastzap/wire.zap:42 (percent_decode)`.
+      placeholder: "src/fastzap.zap:<line> (<fn>)"
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: fastzap commit / Zap toolchain version
+      description: The fastzap commit SHA and, if relevant, `zap --version` from the toolchain image.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: The example above is the smallest I could make it.
+          required: true
+        - label: This is a fastzap defect, not a core Zap language/stdlib defect (those go to `zaplang-io/zap`).
+          required: false

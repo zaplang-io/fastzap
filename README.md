@@ -459,6 +459,16 @@ OpenAPI/Swagger generation (D-FZ-0012), the middleware/filter chain (D-FZ-0013),
 keep-alive + streaming (D-FZ-0014), and HTTPS/TLS termination (D-FZ-0015) have
 since shipped. See [DECISIONS.md](DECISIONS.md).
 
+## Contributing
+
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) — it
+covers the fork/branch/PR flow, how to run the suite through the Zap toolchain
+image, the one-PR-one-issue rule, the exhaustive positive-and-negative test
+discipline, and the docs-per-PR expectation. Agents should also read
+[AGENTS.md](AGENTS.md). Merges require green CI (`hygiene`, `fmt`, `tests`) and one
+approving review from someone other than the author. User-visible changes are
+recorded in [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
