@@ -26,7 +26,12 @@ permissions:
   contents: read
 
 env:
-  # Pinned, anonymously-pullable Zap toolchain image (zaplang-io/zap#277).
+  # Anonymously-pullable Zap toolchain image (zaplang-io/zap#277). Intentionally
+  # the floating `:latest` tag, NOT pinned: fastzap tracks the current toolchain so
+  # it can use new language/stdlib features (and surface upstream breakage) as soon
+  # as they ship. Trade-off: builds aren't reproducible and a green commit can go
+  # red on an upstream release with no change here. Pin to a version tag or digest
+  # if a repo needs reproducibility over currency.
   ZAP_IMAGE: ghcr.io/zaplang-io/zap:latest
 
 jobs:
