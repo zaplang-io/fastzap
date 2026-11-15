@@ -1,0 +1,93 @@
+# PORTABLE across official Zap library repos. The "proposed syntax" + "Python/
+# equivalent library" + "DECISIONS reference" fields encode the workspace
+# convention that every feature issue shows how the eventual syntax reads and
+# points at its prior art / decision record.
+name: Feature request
+description: Propose a new capability or enhancement for fastzap.
+title: "feat: <short summary>"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature issues must be **concrete and testable**. Default size is **M**
+        (one issue ↔ one PR). If the idea spans several PRs, say so — a maintainer
+        will turn it into an **Epic** with linked sub-issues rather than one large
+        issue.
+
+        Still exploring the shape of the idea? Open an
+        [Ideas discussion](https://github.com/zaplang-io/fastzap/discussions) first;
+        settled designs graduate to an issue (and a `DECISIONS.md` entry).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What can't be done today, or what is awkward? Who needs it?
+    validations:
+      required: true
+  - type: textarea
+    id: syntax
+    attributes:
+      label: Proposed Zap syntax / API surface
+      description: >
+        Show how the eventual code will read for a user of fastzap — the decorator,
+        call, or type the programmer writes. This is required: we design from the
+        call site inward.
+      render: python
+      placeholder: |
+        @app.get("/items/{id}")
+        def get_item(id: Path[int], q: Query[str] = "") -> fastzap.Response:
+            ...
+    validations:
+      required: true
+  - type: input
+    id: prior-art
+    attributes:
+      label: FastAPI / Python (or other) equivalent
+      description: The equivalent in FastAPI/Starlette/Flask (or another framework) this mirrors, if any.
+      placeholder: "FastAPI: path/query params declared in the signature"
+    validations:
+      required: false
+  - type: input
+    id: decision-ref
+    attributes:
+      label: Decision / design reference
+      description: Relevant `DECISIONS.md` D-FZ-NNNN, the `zaplang-io/zap#312` epic, or a Discussion link.
+      placeholder: "D-FZ-0008 (open half); zaplang-io/zap#466"
+    validations:
+      required: false
+  - type: textarea
+    id: tests
+    attributes:
+      label: Test plan (positive AND negative)
+      description: >
+        Tests are intent documentation and a walled garden. List the positive cases
+        AND the negative/edge cases a PR must cover (bad input, missing values,
+        boundaries, error status codes).
+      placeholder: |
+        Positive: valid int path param coerces; applied default for absent query.
+        Negative: non-int path -> 422 with field-located error; multiple bad params collect into one 422.
+    validations:
+      required: true
+  - type: dropdown
+    id: dependency
+    attributes:
+      label: Does this depend on a core Zap language/stdlib capability?
+      description: >
+        If fastzap can't build this without a compiler/stdlib change, it is blocked.
+        We report the core gap in `zaplang-io/zap` and do NOT work around it here.
+      options:
+        - "No — fully buildable in fastzap today"
+        - "Yes — blocked on a core zaplang-io/zap capability (link it below)"
+        - "Not sure"
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues/Epics and this is not a duplicate.
+          required: true
+        - label: This is a single, M-sized unit of work (or I've flagged it as an Epic above).
+          required: true

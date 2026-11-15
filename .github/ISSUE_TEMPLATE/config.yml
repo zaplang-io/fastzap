@@ -1,0 +1,13 @@
+# Blank issues are disabled so every issue goes through a form (bug/feature) or to
+# Discussions. PORTABLE boilerplate — only the repo slug in the URLs is per-repo.
+blank_issues_enabled: false
+contact_links:
+  - name: Question or help
+    url: https://github.com/zaplang-io/fastzap/discussions/categories/q-a
+    about: Usage questions and "how do I…" belong in Discussions Q&A, not issues.
+  - name: Idea / design proposal
+    url: https://github.com/zaplang-io/fastzap/discussions/categories/ideas
+    about: Propose and refine a design in Ideas; settled designs graduate to a feature issue + a DECISIONS.md entry.
+  - name: Core Zap language or stdlib defect
+    url: https://github.com/zaplang-io/zap/issues/new/choose
+    about: Bugs in the Zap compiler/stdlib (not fastzap) are reported in zaplang-io/zap.

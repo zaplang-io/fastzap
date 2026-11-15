@@ -1,79 +1,132 @@
 name: ci
 
+# CI is the merge gate for fastzap. Local Docker/LLVM is unavailable to most
+# contributors, so everything that actually compiles or runs Zap happens here.
+#
+# Three nameable jobs, all three required by branch protection on `main`:
+#   hygiene  — repo layout + .zap source sanity + test-wiring guard (no toolchain)
+#   fmt      — canonical `zap fmt --check` over all first-party .zap (toolchain image)
+#   tests    — compile + run the offline suite and compile-smoke the examples
+#
+# PORTABLE across official Zap library repos: the shape (hygiene / fmt / tests) and
+# the toolchain-image invocation are boilerplate. fastzap-SPECIFIC: the exact file
+# list in `hygiene`, and that the example servers are built (not run).
+
 on:
   push:
     branches: [main]
   pull_request:
 
+# One in-flight run per ref; a new push cancels the superseded run to save minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Pinned, anonymously-pullable Zap toolchain image (zaplang-io/zap#277).
+  ZAP_IMAGE: ghcr.io/zaplang-io/zap:latest
+
 jobs:
-  # Repo hygiene: layout + .zap source sanity. Does not compile Zap.
+  # Repo hygiene: layout + .zap source sanity + the test-wiring guard. Does not
+  # compile Zap, so it needs no toolchain image and fails fast.
   hygiene:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Shell script syntax
         run: |
           for f in tools/*.sh; do echo "sh -n $f"; sh -n "$f"; done
+
       - name: Layout sanity
         run: |
+          # fastzap-SPECIFIC file list.
           test -f zap.toml
           test -f src/fastzap.zap
           test -f src/fastzap/wire.zap
           test -f src/fastzap/jsonschema.zap
           test -f vendor/validation/src/validation.zap
           test -f vendor/validation/src/validation/pattern.zap
-          test -f tests/fastzap_test.zap
-          test -s tests/fastzap_test.expected
-          test -f tests/decorator_test.zap
-          test -s tests/decorator_test.expected
-          test -f tests/di_test.zap
-          test -s tests/di_test.expected
-          test -f tests/params_test.zap
-          test -s tests/params_test.expected
-          test -f tests/openapi_test.zap
-          test -s tests/openapi_test.expected
-          test -f tests/middleware_test.zap
-          test -s tests/middleware_test.expected
-          test -f tests/keepalive_test.zap
-          test -s tests/keepalive_test.expected
-          test -f tests/shutdown_test.zap
-          test -s tests/shutdown_test.expected
-          test -f tests/tls_test.zap
-          test -s tests/tls_test.expected
           test -f examples/quickstart.zap
           test -f DESIGN.md
           test -f DECISIONS.md
+          test -f README.md
+          test -f CHANGELOG.md
+          test -f CONTRIBUTING.md
+          test -f AGENTS.md
           echo "layout OK"
-      - name: No CRLF / no tabs in .zap sources
-        run: |
-          ! grep -rlP '\r$' --include='*.zap' . || (echo "CRLF found" && exit 1)
-          ! grep -rlP '\t'  --include='*.zap' . || (echo "tab in .zap" && exit 1)
 
-  # Real compile + run of the offline test suite + example build through the
-  # prebuilt Zap toolchain image (zaplang-io/zap#277), published to GHCR and
-  # anonymously pullable. The image ships no git/node, so `container:` +
-  # actions/checkout is not usable; we check out on the host and run the
-  # toolchain via `docker run` over the mounted workspace. Fast and reproducible
-  # — no building the compiler from source. Not a required gate yet (the repo has
-  # no required checks). Local Docker/LLVM was unavailable while authoring, so
-  # this job (full codegen) is the gate for everything that actually runs the
-  # server + the staged-drain signal path; see DESIGN.md "Testing".
-  zap-tests:
+      - name: Every test driver has a non-empty golden and is wired into the runner
+        run: |
+          # Walled-garden guard: a new tests/<name>_test.zap must ship a non-empty
+          # tests/<name>_test.expected AND be run by tools/run-tests.sh, or the
+          # "tests" job would silently skip it. This keeps `tests` honest as code
+          # and test files are added.
+          rc=0
+          for t in tests/*_test.zap; do
+            [ -e "$t" ] || continue
+            name=$(basename "$t" .zap)
+            if [ ! -s "tests/$name.expected" ]; then
+              echo "::error file=$t::missing or empty golden tests/$name.expected"
+              rc=1
+            fi
+            if ! grep -q "run_one $name\b" tools/run-tests.sh; then
+              echo "::error file=$t::not wired into tools/run-tests.sh (add: run_one $name)"
+              rc=1
+            fi
+          done
+          # Every example must compile-smoke; build-examples.sh globs examples/*.zap,
+          # so just assert at least one example exists.
+          ls examples/*.zap >/dev/null 2>&1 || { echo "::error::no examples/*.zap"; rc=1; }
+          [ $rc -eq 0 ] && echo "test wiring OK"
+          exit $rc
+
+      - name: No CRLF / no tabs in first-party .zap sources
+        run: |
+          # vendor/ is third-party; exclude it from the style guard.
+          ! grep -rlP '\r$' --include='*.zap' src tests examples || (echo "CRLF found" && exit 1)
+          ! grep -rlP '\t'  --include='*.zap' src tests examples || (echo "tab in .zap" && exit 1)
+          echo "line-ending/tab check OK"
+
+  # Canonical formatting gate: dogfoods `zap fmt` (D-0037) over every first-party
+  # .zap file. The vendored dependency under vendor/ is third-party and excluded.
+  # Separate job so it is a nameable required check and fails without spending the
+  # heavier test job's minutes.
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: zap fmt --check (src tests examples)
+        run: |
+          docker run --rm -v "$PWD":/w -w /w "$ZAP_IMAGE" sh -c '
+            set -e
+            echo "zap: $(zap --version)"
+            zap fmt --check src tests examples
+          '
+
+  # Real compile + run of the offline test suite + example compile-smoke, through
+  # the prebuilt Zap toolchain image. The image ships no git/node, so `container:`
+  # + actions/checkout is not usable; we check out on the host and run the
+  # toolchain via `docker run` over the mounted workspace — fast and reproducible,
+  # no building the compiler from source. This job (full codegen) is the gate for
+  # everything that actually runs the server + the staged-drain signal path; see
+  # DESIGN.md "Testing".
+  tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Offline suite + example build in the Zap toolchain image
         run: |
-          docker run --rm -v "$PWD":/w -w /w ghcr.io/zaplang-io/zap:latest sh -c '
+          docker run --rm -v "$PWD":/w -w /w "$ZAP_IMAGE" sh -c '
             set -e
             echo "zap: $(zap --version)"
-            # Canonical formatting gate (dogfoods `zap fmt`, D-0037). The vendored
-            # dependency under vendor/ is third-party and excluded.
-            zap fmt --check src tests examples
             # Compile + run the native offline test suite (multi-module,
             # multi-package: fastzap -> validation).
             sh tools/run-tests.sh
-            # Compile-smoke the example server (it blocks on accept, so it is
-            # built, not run).
+            # Compile-smoke the example server(s) (they block on accept, so they
+            # are built, not run).
             sh tools/build-examples.sh
           '
